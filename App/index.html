@@ -1,0 +1,1244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>AR Hand 3D · 3D Scanner</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  :root{
+    --plasma:#00ffe5;--warn:#ff4060;
+    --ui:#0a0d12;--ui-b:rgba(10,13,18,.82);
+    --font:'JetBrains Mono','Fira Mono',monospace;
+  }
+  html,body{width:100%;height:100%;background:#000;overflow:hidden;font-family:var(--font);color:var(--plasma);}
+  #cam{position:fixed;top:-9999px;left:-9999px;width:320px;height:240px;opacity:0;pointer-events:none;}
+  #gl{position:fixed;inset:0;width:100%!important;height:100%!important;}
+  #hud{position:fixed;inset:0;pointer-events:none;z-index:10;}
+  #hud::after{content:'';position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.035) 2px,rgba(0,0,0,.035) 4px);pointer-events:none;}
+
+  .panel{background:var(--ui-b);border:1px solid rgba(0,255,229,.22);border-radius:5px;backdrop-filter:blur(10px);}
+
+  #status{position:absolute;top:16px;left:16px;padding:6px 11px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;}
+  #status .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--warn);margin-right:7px;vertical-align:middle;transition:background .3s;}
+  #status.on .dot{background:var(--plasma);}
+  #status.on{border-color:rgba(0,255,229,.5);}
+
+  #perf{position:absolute;top:16px;right:16px;padding:4px 8px;font-size:10px;letter-spacing:.08em;color:rgba(0,255,229,.55);}
+  #hands{position:absolute;top:46px;right:16px;padding:4px 8px;font-size:10px;letter-spacing:.08em;color:rgba(0,255,229,.55);}
+
+  #info{position:absolute;bottom:22px;left:50%;transform:translateX(-50%);font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:rgba(0,255,229,.28);white-space:nowrap;}
+
+  #ctrl{position:absolute;bottom:56px;right:16px;pointer-events:all;display:flex;flex-direction:column;gap:5px;}
+  .cb{background:var(--ui-b);border:1px solid rgba(0,255,229,.2);color:rgba(0,255,229,.5);font-family:var(--font);font-size:9px;letter-spacing:.1em;text-transform:uppercase;padding:7px 10px;cursor:pointer;border-radius:3px;transition:all .18s;backdrop-filter:blur(8px);text-align:center;min-width:54px;}
+  .cb.on{border-color:var(--plasma);color:var(--plasma);background:rgba(0,255,229,.1);}
+  .cb:active{transform:scale(.95);}
+  .sep{height:1px;background:rgba(0,255,229,.1);margin:2px 0;}
+
+  /* Torch glow indicator */
+  #torch-indicator{position:absolute;top:76px;right:16px;padding:4px 8px;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,200,80,.0);transition:color .3s;}
+  #torch-indicator.on{color:rgba(255,200,80,.8);}
+
+  /* Splash */
+  #splash{position:fixed;inset:0;background:#000;z-index:100;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;transition:opacity .5s;}
+  #splash h1{font-size:clamp(20px,5vw,32px);letter-spacing:.22em;text-transform:uppercase;color:var(--plasma);text-shadow:0 0 28px rgba(0,255,229,.45);}
+  #splash p{font-size:11px;letter-spacing:.12em;color:rgba(0,255,229,.45);text-align:center;max-width:270px;line-height:1.9;}
+  #start-btn{background:transparent;border:1px solid var(--plasma);color:var(--plasma);font-family:var(--font);font-size:12px;letter-spacing:.2em;text-transform:uppercase;padding:11px 26px;cursor:pointer;border-radius:2px;transition:all .2s;}
+  #start-btn:active{background:rgba(0,255,229,.12);}
+  #lbar{width:190px;height:1px;background:rgba(0,255,229,.13);border-radius:1px;overflow:hidden;}
+  #lfill{height:100%;background:var(--plasma);width:0%;transition:width .28s;box-shadow:0 0 7px var(--plasma);}
+  #ltxt{font-size:10px;letter-spacing:.15em;color:rgba(0,255,229,.38);}
+
+  /* ── Scanner overlay ── */
+  #scan-overlay{
+    position:fixed;inset:0;z-index:50;
+    background:rgba(0,0,0,.88);
+    display:none;flex-direction:column;align-items:center;justify-content:center;
+    gap:0;
+  }
+  #scan-overlay.active{display:flex;}
+
+  #scan-title{
+    font-size:10px;letter-spacing:.25em;text-transform:uppercase;
+    color:rgba(0,255,229,.4);margin-bottom:18px;
+  }
+
+  /* Pose silhouette SVG area */
+  #scan-svg-wrap{
+    width:min(55vw,220px);height:min(55vw,220px);
+    position:relative;margin-bottom:20px;
+  }
+  #scan-svg{width:100%;height:100%;}
+
+  /* Animated ring around silhouette */
+  #scan-ring{
+    position:absolute;inset:-8px;
+    border-radius:50%;
+    border:1px solid rgba(0,255,229,.15);
+  }
+  #scan-ring-progress{
+    position:absolute;inset:-8px;
+    border-radius:50%;
+  }
+
+  #scan-pose-name{
+    font-size:16px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--plasma);text-shadow:0 0 20px rgba(0,255,229,.5);
+    margin-bottom:8px;text-align:center;
+  }
+  #scan-instruction{
+    font-size:10px;letter-spacing:.12em;color:rgba(0,255,229,.45);
+    text-align:center;max-width:260px;line-height:1.8;margin-bottom:18px;
+  }
+
+  /* Countdown ring */
+  #scan-countdown-wrap{
+    position:relative;width:64px;height:64px;margin-bottom:16px;
+  }
+  #scan-countdown-svg{width:64px;height:64px;transform:rotate(-90deg);}
+  #scan-countdown-track{fill:none;stroke:rgba(0,255,229,.1);stroke-width:3;}
+  #scan-countdown-arc{
+    fill:none;stroke:var(--plasma);stroke-width:3;
+    stroke-linecap:round;
+    stroke-dasharray:163;stroke-dashoffset:163;
+    transition:stroke-dashoffset .1s linear;
+    filter:drop-shadow(0 0 4px rgba(0,255,229,.6));
+  }
+  #scan-countdown-arc.capturing{stroke:rgba(255,200,80,.9);filter:drop-shadow(0 0 4px rgba(255,200,80,.6));}
+  #scan-countdown-num{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-size:22px;letter-spacing:0;color:var(--plasma);
+  }
+
+  /* Per-pose dots */
+  #scan-dots{display:flex;gap:7px;margin-bottom:20px;}
+  .sdot{
+    width:7px;height:7px;border-radius:50%;
+    background:rgba(0,255,229,.12);border:1px solid rgba(0,255,229,.2);
+    transition:all .3s;
+  }
+  .sdot.active{background:rgba(0,255,229,.5);border-color:var(--plasma);box-shadow:0 0 6px rgba(0,255,229,.4);}
+  .sdot.done{background:var(--plasma);border-color:var(--plasma);box-shadow:0 0 8px rgba(0,255,229,.5);}
+
+  /* Detection quality bar */
+  #scan-quality-row{display:flex;gap:8px;align-items:center;margin-bottom:6px;}
+  #scan-quality-label{font-size:8px;letter-spacing:.12em;text-transform:uppercase;color:rgba(0,255,229,.3);}
+  #scan-quality-bar{width:100px;height:2px;background:rgba(0,255,229,.1);border-radius:1px;overflow:hidden;}
+  #scan-quality-fill{height:100%;background:var(--plasma);width:0%;transition:width .15s;}
+
+  #scan-cancel{
+    background:transparent;border:1px solid rgba(0,255,229,.2);
+    color:rgba(0,255,229,.35);font-family:var(--font);font-size:9px;
+    letter-spacing:.15em;text-transform:uppercase;padding:7px 18px;
+    cursor:pointer;border-radius:2px;transition:all .2s;margin-top:4px;
+  }
+  #scan-cancel:active{background:rgba(255,64,96,.1);border-color:rgba(255,64,96,.4);color:rgba(255,64,96,.7);}
+
+  /* ── Scan complete modal ── */
+  #scan-result{
+    position:fixed;inset:0;z-index:60;
+    background:rgba(0,0,0,.92);
+    display:none;flex-direction:column;align-items:center;justify-content:center;
+    gap:14px;
+  }
+  #scan-result.active{display:flex;}
+  #scan-result h2{font-size:13px;letter-spacing:.25em;text-transform:uppercase;color:var(--plasma);text-shadow:0 0 20px rgba(0,255,229,.4);}
+  #scan-metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px 20px;margin:4px 0;}
+  .smet{display:flex;flex-direction:column;gap:2px;}
+  .smet-label{font-size:7px;letter-spacing:.15em;text-transform:uppercase;color:rgba(0,255,229,.3);}
+  .smet-val{font-size:12px;letter-spacing:.08em;color:var(--plasma);}
+  #scan-result-btns{display:flex;gap:8px;margin-top:6px;}
+  .sr-btn{
+    background:transparent;border:1px solid rgba(0,255,229,.3);
+    color:rgba(0,255,229,.6);font-family:var(--font);font-size:9px;
+    letter-spacing:.15em;text-transform:uppercase;padding:8px 16px;
+    cursor:pointer;border-radius:2px;transition:all .2s;
+  }
+  .sr-btn.primary{border-color:var(--plasma);color:var(--plasma);background:rgba(0,255,229,.08);}
+  .sr-btn:active{transform:scale(.96);}
+
+  /* ── Point cloud badge ── */
+  #cloud-badge{
+    position:absolute;top:76px;left:16px;padding:4px 8px;
+    font-size:9px;letter-spacing:.1em;text-transform:uppercase;
+    color:rgba(0,255,229,.0);transition:color .3s;pointer-events:none;
+  }
+  #cloud-badge.on{color:rgba(0,255,229,.55);}
+
+  /* Scan button highlight */
+  #bscan.scanning{border-color:rgba(255,200,80,.7);color:rgba(255,200,80,.9);background:rgba(255,200,80,.08);}
+  #bscan.done{border-color:var(--plasma);color:var(--plasma);background:rgba(0,255,229,.1);}
+
+  /* ── White screen light source ── */
+  #white-screen{
+    position:fixed;inset:0;z-index:200;
+    background:#fff;
+    display:none;cursor:pointer;
+  }
+  #white-screen.active{display:block;}
+  #bwhite.on{border-color:#fff;color:#fff;background:rgba(255,255,255,.12);}
+</style>
+</head>
+<body>
+<video id="cam" playsinline autoplay muted width="320" height="240"></video>
+<canvas id="gl"></canvas>
+
+<div id="hud">
+  <div id="status" class="panel"><span class="dot"></span><span id="stxt">Initializing</span></div>
+  <div id="perf" class="panel">-- fps · -- ms</div>
+  <div id="hands" class="panel">0 hand(s)</div>
+  <div id="torch-indicator">⚡ Torch</div>
+  <div id="cloud-badge">◈ Point Cloud</div>
+  <div id="info">Show hand to camera</div>
+  <div id="ctrl">
+    <button class="cb on" id="bm">Mesh</button>
+    <button class="cb" id="bw">Wire</button>
+    <button class="cb" id="bs">Skel</button>
+    <div class="sep"></div>
+    <button class="cb" id="bcloud">Cloud</button>
+    <div class="sep"></div>
+    <button class="cb on" id="bt">Torch</button>
+    <div class="sep"></div>
+    <button class="cb" id="bwhite">White</button>
+    <div class="sep"></div>
+    <button class="cb" id="bscan">Scan</button>
+    <div class="sep"></div>
+    <button class="cb" id="bc">↺ Cam</button>
+  </div>
+</div>
+
+<!-- White screen light source — tap anywhere to dismiss -->
+<div id="white-screen"></div>
+
+<!-- Scanner overlay -->
+<div id="scan-overlay">
+  <div id="scan-title">3D Hand Scanner</div>
+  <div id="scan-dots">
+    <div class="sdot" id="sdot-0"></div>
+    <div class="sdot" id="sdot-1"></div>
+    <div class="sdot" id="sdot-2"></div>
+    <div class="sdot" id="sdot-3"></div>
+    <div class="sdot" id="sdot-4"></div>
+    <div class="sdot" id="sdot-5"></div>
+  </div>
+  <div id="scan-svg-wrap">
+    <svg id="scan-svg" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <!-- Hand silhouette paths, swapped per pose by JS -->
+      <g id="scan-sil" opacity="0.35" stroke="rgba(0,255,229,1)" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+        <!-- Default: palm front - simple hand outline -->
+        <path d="M38 95 Q30 80 30 65 L30 42 Q30 36 36 36 Q42 36 42 42 L42 38 Q42 32 48 32 Q54 32 54 38 L54 36 Q54 30 60 30 Q66 30 66 36 L66 38 Q66 32 72 32 Q78 32 78 38 L78 65 Q78 75 82 85 Q86 95 80 100 Q60 108 40 100 Z"/>
+        <line x1="42" y1="42" x2="42" y2="95"/>
+        <line x1="54" y1="38" x2="54" y2="95"/>
+        <line x1="66" y1="36" x2="66" y2="95"/>
+        <line x1="78" y1="38" x2="78" y2="95"/>
+      </g>
+    </svg>
+    <div id="scan-ring"></div>
+    <svg id="scan-ring-progress" style="position:absolute;inset:-8px;width:calc(100% + 16px);height:calc(100% + 16px);" viewBox="0 0 240 240">
+      <circle cx="120" cy="120" r="116" fill="none" stroke="rgba(0,255,229,.08)" stroke-width="2"/>
+      <circle id="scan-arc" cx="120" cy="120" r="116" fill="none" stroke="rgba(0,255,229,.7)" stroke-width="2"
+        stroke-linecap="round"
+        stroke-dasharray="729" stroke-dashoffset="729"
+        transform="rotate(-90 120 120)"
+        style="transition:stroke-dashoffset .1s linear;filter:drop-shadow(0 0 4px rgba(0,255,229,.5))"/>
+    </svg>
+  </div>
+  <div id="scan-pose-name">—</div>
+  <div id="scan-instruction">Hold your hand steady</div>
+  <div id="scan-countdown-wrap">
+    <svg id="scan-countdown-svg" viewBox="0 0 64 64">
+      <circle class="scan-countdown-track" cx="32" cy="32" r="26" fill="none" stroke="rgba(0,255,229,.1)" stroke-width="3"/>
+      <circle id="scan-countdown-arc" cx="32" cy="32" r="26" fill="none" stroke="rgba(0,255,229,.9)" stroke-width="3"
+        stroke-linecap="round" stroke-dasharray="163" stroke-dashoffset="163"
+        transform="rotate(-90 32 32)"
+        style="transition:stroke-dashoffset .08s linear;filter:drop-shadow(0 0 3px rgba(0,255,229,.6));"/>
+    </svg>
+    <div id="scan-countdown-num">—</div>
+  </div>
+  <div id="scan-quality-row">
+    <span id="scan-quality-label">Signal</span>
+    <div id="scan-quality-bar"><div id="scan-quality-fill"></div></div>
+  </div>
+  <button id="scan-cancel">Cancel</button>
+</div>
+
+<!-- Scan result modal -->
+<div id="scan-result">
+  <h2>Scan Complete</h2>
+  <div id="scan-metrics"></div>
+  <div id="scan-result-btns">
+    <button class="sr-btn" id="sr-discard">Discard</button>
+    <button class="sr-btn primary" id="sr-apply">Apply to Model</button>
+  </div>
+</div>
+
+<div id="splash">
+  <h1>AR Hand 3D</h1>
+  <p>Anatomical hand model · 60fps TF.js backbone<br>3D Scanner · Personalized model</p>
+  <div id="lbar"><div id="lfill"></div></div>
+  <div id="ltxt">Loading…</div>
+  <button id="start-btn" style="display:none">Start</button>
+</div>
+
+<!-- Three.js r128 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<!-- TF.js + HandPose (WebGL GPU inference) -->
+<!-- MediaPipe Tasks Vision (WASM-based, replaces TF.js) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs"
+  type="module" crossorigin="anonymous"></script>
+
+<script type="module">
+
+// ─── Skeleton topology ────────────────────────────────────────────────────
+const CONN = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],
+];
+
+// Per-segment taper radii (relative, scaled at runtime)
+const FINGERS = [
+  {c:[0,1,2,3,4],   r:[.38,.30,.26,.22,.18]}, // thumb
+  {c:[0,5,6,7,8],   r:[.32,.32,.27,.23,.18]}, // index
+  {c:[0,9,10,11,12],r:[.32,.34,.28,.24,.19]}, // middle
+  {c:[0,13,14,15,16],r:[.30,.30,.26,.22,.18]}, // ring
+  {c:[0,17,18,19,20],r:[.26,.24,.20,.17,.14]}, // pinky
+];
+const TIPS = new Set([4,8,12,16,20]);
+const KNUCKLES = new Set([5,9,13,17]);
+
+// ─── State ────────────────────────────────────────────────────────────────
+let mode = 'mesh';
+let torchOn = true;
+let facingMode = 'user';
+let activeCameraTrack = null;
+let inferenceMs = 0;
+let fps = 0, fc = 0, ft = performance.now();
+
+// ─── Detection state ──────────────────────────────────────────────────────
+let detector = null, detectorReady = false;
+let camStream = null;
+let rawHands    = []; // latest from GPU detector (async)
+let smoothHands = []; // exponentially smoothed, used for render (60fps)
+const SMOOTH = 0.45;  // 0=no smoothing 1=frozen; lower = more responsive
+
+function smoothLandmarks(prev, next) {
+  if (!prev || prev.length !== next.length) return next.map(l => ({...l}));
+  return next.map((lm, i) => ({
+    x: prev[i].x + (lm.x - prev[i].x) * (1 - SMOOTH),
+    y: prev[i].y + (lm.y - prev[i].y) * (1 - SMOOTH),
+    z: prev[i].z + (lm.z - prev[i].z) * (1 - SMOOTH),
+  }));
+}
+
+// ─── Renderer ─────────────────────────────────────────────────────────────
+const canvas = document.getElementById('gl');
+const R = new THREE.WebGLRenderer({canvas, antialias:true, powerPreference:'high-performance'});
+R.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+R.setClearColor(0x000000, 1);
+R.shadowMap.enabled = false;
+R.setSize(window.innerWidth, window.innerHeight);
+
+const scene = new THREE.Scene();
+
+// Orthographic camera — landmark coords map directly to screen
+const CAM = new THREE.OrthographicCamera(-1,1,1,-1,-10,10);
+CAM.position.z = 1;
+
+// ─── Lighting ─────────────────────────────────────────────────────────────
+const ambL = new THREE.AmbientLight(0x1a2a3a, 2.5);
+scene.add(ambL);
+
+const keyL = new THREE.DirectionalLight(0x88ddff, 1.8);
+keyL.position.set(1, 2, 3);
+scene.add(keyL);
+
+const rimL = new THREE.DirectionalLight(0x0033aa, 0.8);
+rimL.position.set(-2, -1, 1);
+scene.add(rimL);
+
+// Torch: PointLight at index fingertip
+const torchLight = new THREE.PointLight(0xffc850, 0, 1.5, 2); // intensity 0 = off
+torchLight.position.set(0, 0, 0);
+scene.add(torchLight);
+
+// Torch glow sprite (lens flare substitute)
+const torchGlowGeo = new THREE.SphereGeometry(0.012, 8, 6);
+const torchGlowMat = new THREE.MeshBasicMaterial({color:0xffdd88, transparent:true, opacity:0.0});
+const torchGlowMesh = new THREE.Mesh(torchGlowGeo, torchGlowMat);
+scene.add(torchGlowMesh);
+
+// ─── Low-poly hand ───────────────────────────────────────────────────────
+
+// ─── Materials ────────────────────────────────────────────────────────────
+function skinMat() {
+  return new THREE.MeshPhongMaterial({
+    color: 0x4ab0cc,
+    emissive: 0x051a22,
+    specular: 0x88ddff,
+    shininess: 55,
+    flatShading: true,
+    transparent: true,
+    opacity: 0.93,
+    side: THREE.DoubleSide,
+  });
+}
+function lineMat() {
+  return new THREE.LineBasicMaterial({color:0x00ffe5, transparent:true, opacity:0.75});
+}
+function dotMat(tip) {
+  return new THREE.MeshPhongMaterial({
+    color: tip ? 0xff2255 : 0x00bbaa,
+    emissive: tip ? 0x1a000a : 0x001510,
+    flatShading: true,
+    transparent: true, opacity: tip ? 1.0 : 0.9,
+  });
+}
+function palmMat() {
+  return new THREE.MeshPhongMaterial({
+    color: 0x38a0bc,
+    emissive: 0x041015,
+    specular: 0x44bbcc,
+    shininess: 35,
+    flatShading: true,
+    transparent: true,
+    opacity: 0.80,
+    side: THREE.DoubleSide,
+  });
+}
+
+// ─── Hand renderer ────────────────────────────────────────────────────────
+const UP = new THREE.Vector3(0, 1, 0);
+
+class HandRenderer {
+  constructor() {
+    this.group = new THREE.Group();
+    scene.add(this.group);
+    this.group.visible = false;
+    this.bones  = [];
+    this.joints = [];
+    this.lines  = [];
+    this.palmMesh = null;
+    this._build();
+  }
+
+  _build() {
+    // 20 bone segments — tapered hex prism per phalanx
+    // taper ratios: tip_r / base_r per segment, order matches FINGERS chain
+    const TAPER = [
+      // thumb: 4 segs
+      0.75, 0.80, 0.82, 0.85,
+      // index: 4 segs
+      0.80, 0.82, 0.84, 0.86,
+      // middle: 4 segs
+      0.80, 0.82, 0.84, 0.86,
+      // ring: 4 segs
+      0.80, 0.82, 0.84, 0.86,
+      // pinky: 4 segs
+      0.78, 0.80, 0.82, 0.85,
+    ];
+    for (let i = 0; i < 20; i++) {
+      const t = TAPER[i] || 0.82;
+      // CylinderGeometry(radiusTop, radiusBottom, height, radialSegs)
+      const geo = new THREE.CylinderGeometry(t, 1, 1, 6, 1);
+      const mesh = new THREE.Mesh(geo, skinMat());
+      this.group.add(mesh);
+      this.bones.push(mesh);
+    }
+
+    // 21 joints — low-poly icosphere
+    for (let i = 0; i < 21; i++) {
+      const isTip = TIPS.has(i);
+      const geo = new THREE.IcosahedronGeometry(1, 1);
+      const mesh = new THREE.Mesh(geo, dotMat(isTip));
+      this.group.add(mesh);
+      this.joints.push(mesh);
+    }
+
+    // 23 skeleton lines
+    for (let i = 0; i < CONN.length; i++) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute([0,0,0,0,0,0], 3));
+      const l = new THREE.Line(geo, lineMat());
+      this.group.add(l);
+      this.lines.push(l);
+    }
+
+    // Palm — 8 triangles as non-indexed (flat shaded facets)
+    const pg = new THREE.BufferGeometry();
+    pg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(8*3*3), 3));
+    this.palmMesh = new THREE.Mesh(pg, palmMat());
+    this.group.add(this.palmMesh);
+  }
+
+  update(lms, aspect, mirrorX) {
+    if (!lms || lms.length < 21) { this.group.visible = false; return; }
+    this.group.visible = true;
+
+    const pts = lms.map(lm => {
+      const nx = mirrorX ? (1 - lm.x) : lm.x;
+      return new THREE.Vector3(
+        (nx - 0.5) * 2 * aspect,
+        -(lm.y - 0.5) * 2,
+        -lm.z * 0.6
+      );
+    });
+
+    const ref   = Math.max(pts[0].distanceTo(pts[9]), 0.01);
+    const unitR = ref * 0.09;
+
+    const showMesh = mode === 'mesh';
+    const showWire = mode === 'wire';
+    const showSkel = mode === 'skel';
+
+    // ── Bones ──
+    let bi = 0;
+    for (const f of FINGERS) {
+      for (let si = 1; si < f.c.length; si++) {
+        const bone = this.bones[bi++];
+        const a = pts[f.c[si-1]], b = pts[f.c[si]];
+        const len = a.distanceTo(b);
+
+        if (len < 0.001) { bone.visible = false; continue; }
+        bone.visible = showMesh || showWire;
+
+        // radius tapers from base (r2) to tip (r1)
+        const r1 = f.r[si]   * unitR;
+        const r2 = f.r[si-1] * unitR;
+        // CylinderGeometry has taper baked in (top=t, bottom=1)
+        // Scale by base radius r2 so the bottom matches joint width
+        bone.scale.set(r2, len, r2);
+        bone.position.copy(a).lerp(b, 0.5);
+
+        const dir = new THREE.Vector3().subVectors(b, a).normalize();
+        const dot = dir.dot(UP);
+        if (Math.abs(dot) > 0.9999) {
+          bone.quaternion.set(0, 0, dot < 0 ? 1 : 0, dot < 0 ? 0 : 1).normalize();
+        } else {
+          bone.quaternion.setFromUnitVectors(UP, dir);
+        }
+
+        bone.material.wireframe = showWire;
+        bone.material.opacity   = showWire ? 0.55 : 0.93;
+      }
+    }
+    for (let i = bi; i < this.bones.length; i++) this.bones[i].visible = false;
+
+    // ── Joints ──
+    for (let i = 0; i < 21; i++) {
+      const j = this.joints[i];
+      j.visible = showSkel;
+      j.position.copy(pts[i]);
+      const isTip = TIPS.has(i), isK = KNUCKLES.has(i);
+      const r = (isTip ? 1.35 : isK ? 1.15 : 0.9) * unitR;
+      j.scale.setScalar(Math.max(r, 0.002));
+      j.material.wireframe = false;
+    }
+
+    // ── Lines ──
+    for (let i = 0; i < CONN.length; i++) {
+      const l = this.lines[i];
+      const pa = l.geometry.attributes.position.array;
+      const a = pts[CONN[i][0]], b = pts[CONN[i][1]];
+      pa[0]=a.x; pa[1]=a.y; pa[2]=a.z;
+      pa[3]=b.x; pa[4]=b.y; pa[5]=b.z;
+      l.geometry.attributes.position.needsUpdate = true;
+      l.visible = showSkel || showWire;
+    }
+
+    // ── Palm — 8 flat-shaded tris filling the palm area ──
+    // Fan from palm centre outward for nice facets
+    const ctr = new THREE.Vector3()
+      .add(pts[0]).add(pts[5]).add(pts[9]).add(pts[13]).add(pts[17])
+      .multiplyScalar(0.2);
+
+    const rim = [pts[1], pts[5], pts[6], pts[9], pts[10], pts[13], pts[14], pts[17], pts[0]];
+    const palmTris = [
+      [ctr, pts[0],  pts[1] ],
+      [ctr, pts[1],  pts[5] ],
+      [ctr, pts[5],  pts[9] ],
+      [ctr, pts[9],  pts[13]],
+      [ctr, pts[13], pts[17]],
+      [ctr, pts[17], pts[0] ],
+      [pts[5], pts[6],  pts[9] ],
+      [pts[9], pts[10], pts[13]],
+    ];
+
+    const pa = this.palmMesh.geometry.attributes.position.array;
+    palmTris.forEach((tri, ti) => {
+      tri.forEach((v, vi) => {
+        pa[(ti*3+vi)*3+0] = v.x;
+        pa[(ti*3+vi)*3+1] = v.y;
+        pa[(ti*3+vi)*3+2] = v.z;
+      });
+    });
+    this.palmMesh.geometry.attributes.position.needsUpdate = true;
+    this.palmMesh.geometry.computeVertexNormals();
+    this.palmMesh.visible = showMesh;
+
+    return pts[8]; // torch anchor
+  }
+
+  hide() { this.group.visible = false; }
+}
+
+const HR = [new HandRenderer(), new HandRenderer()];
+
+// ─── Resize ───────────────────────────────────────────────────────────────
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  R.setSize(w, h);
+  const a = w/h;
+  CAM.left=-a; CAM.right=a; CAM.top=1; CAM.bottom=-1;
+  CAM.updateProjectionMatrix();
+}
+window.addEventListener('resize', onResize);
+onResize();
+
+// ─── Render loop ──────────────────────────────────────────────────────────
+// Decouple rendering from MediaPipe inference:
+// Three.js runs at display refresh rate (rAF)
+// MediaPipe runs as fast as it can separately
+// → no frame drops from inference blocking render
+
+let torchPos = new THREE.Vector3();
+let torchVisible = false;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  fc++;
+  const now = performance.now();
+  if (now - ft >= 1000) {
+    fps = fc; fc = 0; ft = now;
+    document.getElementById('perf').textContent =
+      fps + ' fps · ' + inferenceMs.toFixed(0) + ' ms';
+  }
+
+  const aspect  = window.innerWidth / window.innerHeight;
+
+  // Smooth raw detector output → silky 60fps hand even at lower inference rate
+  if (rawHands.length > 0) {
+    smoothHands = rawHands.map((lms, hi) =>
+      smoothLandmarks(smoothHands[hi] || null, lms)
+    );
+    document.getElementById('status').className = 'panel on';
+    document.getElementById('stxt').textContent  = 'Tracking';
+    document.getElementById('hands').textContent = smoothHands.length + ' hand(s)';
+  } else if (smoothHands.length > 0) {
+    smoothHands = [];
+    document.getElementById('status').className = 'panel';
+    document.getElementById('stxt').textContent  = 'Scanning';
+    document.getElementById('hands').textContent = '0 hand(s)';
+  }
+  const mirrorX = (facingMode === 'user');
+
+  torchVisible = false;
+  for (let i = 0; i < 2; i++) {
+    if (i < smoothHands.length) {
+      const tip = HR[i].update(smoothHands[i], aspect, mirrorX);
+      if (tip && i === 0) { torchPos.copy(tip); torchVisible = true; }
+    } else {
+      HR[i].hide();
+    }
+  }
+
+  // Torch update
+  if (torchOn && torchVisible) {
+    torchLight.position.copy(torchPos);
+    torchLight.intensity = 2.2;
+    torchGlowMesh.position.copy(torchPos);
+    torchGlowMat.opacity = 0.65;
+    document.getElementById('torch-indicator').className = 'on';
+  } else {
+    torchLight.intensity = 0;
+    torchGlowMat.opacity = 0;
+    document.getElementById('torch-indicator').className = '';
+  }
+
+  R.render(scene, CAM);
+}
+animate();
+
+const video = document.getElementById('cam');
+
+// ─── MediaPipe Tasks Vision — Hand Landmarker ────────────────────────────
+import { HandLandmarker, FilesetResolver }
+  from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs';
+
+const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm';
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+async function initDetector() {
+  const lfill = document.getElementById('lfill');
+  const ltxt  = document.getElementById('ltxt');
+  lfill.style.width = '20%';
+  ltxt.textContent = 'Loading WASM…';
+  try {
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    lfill.style.width = '55%';
+    ltxt.textContent = 'Loading model…';
+
+    detector = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: MODEL_URL,
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+
+    lfill.style.width = '100%';
+    ltxt.textContent = 'Ready';
+    detectorReady = true;
+    setTimeout(() => {
+      document.getElementById('lbar').style.display = 'none';
+      ltxt.style.display = 'none';
+      document.getElementById('start-btn').style.display = 'block';
+    }, 300);
+  } catch(e) {
+    ltxt.textContent = 'Error: ' + e.message;
+    console.error(e);
+  }
+}
+
+// ─── Inference loop — MediaPipe detectForVideo ────────────────────────────
+// detectForVideo is synchronous — run inside rAF, throttled to avoid overload
+let lastVideoTime = -1;
+
+function inferenceLoop() {
+  requestAnimationFrame(inferenceLoop);
+  if (!detectorReady || !detector || !video.videoWidth) return;
+  if (video.currentTime === lastVideoTime) return; // no new frame
+  lastVideoTime = video.currentTime;
+
+  const t0 = performance.now();
+  try {
+    const result = detector.detectForVideo(video, performance.now());
+    if (result && result.landmarks && result.landmarks.length > 0) {
+      rawHands = result.landmarks.map((lms, hi) => {
+        const wlms = result.worldLandmarks[hi] || [];
+        return lms.map((lm, i) => ({
+          x: lm.x,           // already [0,1]
+          y: lm.y,           // already [0,1]
+          // worldLandmarks z is in metres, scale to scene units
+          z: wlms[i] ? wlms[i].z * 2.5 : 0,
+        }));
+      });
+    } else {
+      rawHands = [];
+    }
+  } catch(e) { rawHands = []; }
+  inferenceMs = performance.now() - t0;
+}
+
+inferenceLoop(); // start immediately; camera start triggers actual detection
+
+// ─── Camera ───────────────────────────────────────────────────────────────
+async function startCamera(facing) {
+  facingMode = facing || 'user';
+
+  if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+
+  document.getElementById('stxt').textContent = 'Requesting…';
+  const ltxt = document.getElementById('ltxt');
+
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode,
+        width:     { ideal: 1920 },
+        height:    { ideal: 1080 },
+        frameRate: { ideal: 60 },
+      },
+      audio: false,
+    });
+  } catch(err) {
+    document.getElementById('stxt').textContent = 'Denied';
+    ltxt.textContent = err.name === 'NotAllowedError'
+      ? 'Camera denied. Allow in browser settings, then reload.'
+      : 'Camera error: ' + err.message;
+    ltxt.style.display = 'block';
+    const b = document.getElementById('start-btn');
+    b.textContent = 'Retry'; b.style.display = 'block';
+    return;
+  }
+
+  video.srcObject = camStream;
+  await new Promise(res => { video.onloadedmetadata = res; });
+  await video.play();
+
+  activeCameraTrack = camStream.getVideoTracks()[0] || null;
+  applyHardwareTorch(torchOn);
+
+  document.getElementById('splash').style.opacity = '0';
+  setTimeout(() => document.getElementById('splash').style.display='none', 500);
+  document.getElementById('stxt').textContent = 'Scanning';
+}
+
+// ─── UI: view mode buttons ────────────────────────────────────────────────
+document.getElementById('start-btn').addEventListener('click', () => startCamera('user'));
+
+['mesh','wire','skel'].forEach(m => {
+  document.getElementById('b'+m[0]).addEventListener('click', () => {
+    mode = m;
+    ['bm','bw','bs'].forEach(id => document.getElementById(id).classList.remove('on'));
+    document.getElementById('b'+m[0]).classList.add('on');
+  });
+});
+
+// ─── Hardware torch helper ─────────────────────────────────────────────────
+async function applyHardwareTorch(on) {
+  if (!activeCameraTrack) return;
+  try {
+    const caps = activeCameraTrack.getCapabilities();
+    if (caps && caps.torch) {
+      await activeCameraTrack.applyConstraints({ advanced: [{ torch: on }] });
+    }
+  } catch(e) { console.warn('Hardware torch unavailable:', e.message); }
+}
+
+document.getElementById('bt').addEventListener('click', () => {
+  torchOn = !torchOn;
+  document.getElementById('bt').classList.toggle('on', torchOn);
+  applyHardwareTorch(torchOn);
+});
+
+document.getElementById('bc').addEventListener('click', () => {
+  const next = facingMode === 'user' ? 'environment' : 'user';
+  document.getElementById('bc').textContent = next === 'user' ? '↺ Front' : '↺ Back';
+  startCamera(next);
+});
+
+// ─── Point Cloud ──────────────────────────────────────────────────────────
+let showCloud = false;
+let cloudPoints = []; // [{x,y,z}, ...] in world space — fused scan data
+
+// Three.js point cloud object
+const cloudGeo = new THREE.BufferGeometry();
+const cloudMat = new THREE.PointsMaterial({
+  color: 0x00ffe5, size: 0.018,
+  transparent: true, opacity: 0.75,
+  sizeAttenuation: true,
+  depthWrite: false,
+});
+const cloudMesh = new THREE.Points(cloudGeo, cloudMat);
+cloudMesh.visible = false;
+scene.add(cloudMesh);
+
+function updateCloudMesh() {
+  if (!cloudPoints.length) return;
+  const buf = new Float32Array(cloudPoints.length * 3);
+  cloudPoints.forEach((p, i) => {
+    buf[i*3]   = p.x;
+    buf[i*3+1] = p.y;
+    buf[i*3+2] = p.z;
+  });
+  cloudGeo.setAttribute('position', new THREE.BufferAttribute(buf, 3));
+  cloudGeo.computeBoundingSphere();
+  cloudMesh.visible = showCloud && cloudPoints.length > 0;
+}
+
+document.getElementById('bcloud').addEventListener('click', () => {
+  showCloud = !showCloud;
+  document.getElementById('bcloud').classList.toggle('on', showCloud);
+  cloudMesh.visible = showCloud && cloudPoints.length > 0;
+  document.getElementById('cloud-badge').className = showCloud && cloudPoints.length ? 'on' : '';
+});
+
+// ─── Personalised model storage ───────────────────────────────────────────
+// Stores per-segment bone lengths derived from scan, applied to HandRenderer
+let personalModel = null;
+
+try {
+  const saved = localStorage.getItem('hand_scan_v1');
+  if (saved) personalModel = JSON.parse(saved);
+} catch(e) {}
+
+// Finger segment pairs: [proximal_idx, distal_idx] for each phalanx
+const SEG_PAIRS = [
+  // thumb
+  [1,2],[2,3],[3,4],
+  // index
+  [5,6],[6,7],[7,8],
+  // middle
+  [9,10],[10,11],[11,12],
+  // ring
+  [13,14],[14,15],[15,16],
+  // pinky
+  [17,18],[18,19],[19,20],
+];
+
+function lmDist(a, b) {
+  const dx = a.x-b.x, dy = a.y-b.y, dz = a.z-b.z;
+  return Math.sqrt(dx*dx+dy*dy+dz*dz);
+}
+
+// Extract bone length ratios relative to palm diagonal (lm0→lm9)
+function extractBoneRatios(lms) {
+  const palmRef = Math.max(lmDist(lms[0], lms[9]), 1e-6);
+  return SEG_PAIRS.map(([a,b]) => lmDist(lms[a], lms[b]) / palmRef);
+}
+
+// Apply personalModel radii to HandRenderer bones
+// We scale taper radii proportional to segment length ratios
+function applyPersonalModel(hr, ratios) {
+  if (!ratios || ratios.length !== SEG_PAIRS.length) return;
+  // Map ratios back into FINGERS r[] arrays
+  // SEG_PAIRS order: thumb(3), index(3), middle(3), ring(3), pinky(3)
+  let ri = 0;
+  for (let fi = 0; fi < FINGERS.length; fi++) {
+    const f = FINGERS[fi];
+    for (let si = 1; si < f.c.length; si++) {
+      // Scale radius proportionally to measured ratio vs default
+      const measuredRatio = ratios[ri] || 1;
+      // Keep original taper shape but scale overall thickness
+      // Clamp to [0.6, 1.6] × original to avoid degenerate shapes
+      const scale = Math.max(0.6, Math.min(1.6, measuredRatio * 4.5));
+      hr.bones[ri].geometry.dispose();
+      const t = [0.75,0.80,0.82,0.85, 0.80,0.82,0.84,0.86, 0.80,0.82,0.84,0.86, 0.80,0.82,0.84,0.86, 0.78,0.80,0.82,0.85][ri] || 0.82;
+      hr.bones[ri].geometry = new THREE.CylinderGeometry(t, 1, 1, 6, 1);
+      ri++;
+    }
+  }
+}
+
+// ─── 3D Scanner ───────────────────────────────────────────────────────────
+const SCAN_POSES = [
+  {
+    name: 'Palm Front',
+    instruction: 'Open hand · face palm toward camera',
+    duration: 4000,   // countdown ms
+    captureDuration: 1200,
+    silPath: `<path d="M38 95 Q30 80 30 65 L30 42 Q30 36 36 36 Q42 36 42 42 L42 38 Q42 32 48 32 Q54 32 54 38 L54 36 Q54 30 60 30 Q66 30 66 36 L66 38 Q66 32 72 32 Q78 32 78 38 L78 65 Q78 75 82 85 Q86 95 80 100 Q60 108 40 100 Z" stroke="rgba(0,255,229,.9)" stroke-width="1.4" fill="none"/><line x1="42" y1="42" x2="42" y2="90" stroke="rgba(0,255,229,.4)" stroke-width="1"/><line x1="54" y1="38" x2="54" y2="90" stroke="rgba(0,255,229,.4)" stroke-width="1"/><line x1="66" y1="36" x2="66" y2="90" stroke="rgba(0,255,229,.4)" stroke-width="1"/><line x1="78" y1="38" x2="78" y2="90" stroke="rgba(0,255,229,.4)" stroke-width="1"/>`,
+  },
+  {
+    name: 'Palm Back',
+    instruction: 'Rotate hand · show back of hand',
+    duration: 4000,
+    captureDuration: 1200,
+    silPath: `<path d="M38 95 Q30 80 30 65 L30 42 Q30 36 36 36 Q42 36 42 42 L42 38 Q42 32 48 32 Q54 32 54 38 L54 36 Q54 30 60 30 Q66 30 66 36 L66 38 Q66 32 72 32 Q78 32 78 38 L78 65 Q78 75 82 85 Q86 95 80 100 Q60 108 40 100 Z" stroke="rgba(0,255,229,.9)" stroke-width="1.4" fill="rgba(0,255,229,.05)"/><circle cx="54" cy="55" r="3" stroke="rgba(0,255,229,.5)" stroke-width="1" fill="none"/><circle cx="66" cy="52" r="3" stroke="rgba(0,255,229,.5)" stroke-width="1" fill="none"/><circle cx="78" cy="55" r="3" stroke="rgba(0,255,229,.5)" stroke-width="1" fill="none"/>`,
+  },
+  {
+    name: 'Side Left',
+    instruction: 'Rotate 90° · thumb pointing up',
+    duration: 4000,
+    captureDuration: 1200,
+    silPath: `<path d="M55 30 L55 95 Q55 105 60 105 Q65 105 65 95 L65 30 Q65 22 60 20 Q55 22 55 30 Z" stroke="rgba(0,255,229,.9)" stroke-width="1.4" fill="none"/><path d="M60 30 Q80 35 82 50 Q84 65 60 68" stroke="rgba(0,255,229,.5)" stroke-width="1" fill="none"/>`,
+  },
+  {
+    name: 'Side Right',
+    instruction: 'Rotate 90° · pinky pointing up',
+    duration: 4000,
+    captureDuration: 1200,
+    silPath: `<path d="M55 30 L55 95 Q55 105 60 105 Q65 105 65 95 L65 30 Q65 22 60 20 Q55 22 55 30 Z" stroke="rgba(0,255,229,.9)" stroke-width="1.4" fill="none"/><path d="M60 30 Q40 35 38 50 Q36 65 60 68" stroke="rgba(0,255,229,.5)" stroke-width="1" fill="none"/>`,
+  },
+  {
+    name: 'Fingers Spread',
+    instruction: 'Spread fingers wide · palm facing camera',
+    duration: 4000,
+    captureDuration: 1200,
+    silPath: `<path d="M58 95 L40 50 Q38 40 44 38 Q50 36 52 46 L46 30 Q44 22 50 20 Q56 18 58 28 L56 24 Q54 16 60 14 Q66 16 64 24 L62 28 Q64 18 70 20 Q76 22 74 30 L68 46 Q70 36 76 38 Q82 40 80 50 L62 95 Z" stroke="rgba(0,255,229,.9)" stroke-width="1.4" fill="none"/>`,
+  },
+  {
+    name: 'Fist',
+    instruction: 'Close hand into a fist',
+    duration: 4000,
+    captureDuration: 1200,
+    silPath: `<path d="M35 65 Q33 50 38 42 Q50 38 72 38 Q82 42 82 55 Q82 70 78 80 Q72 92 60 94 Q45 94 38 85 Q34 78 35 65 Z" stroke="rgba(0,255,229,.9)" stroke-width="1.4" fill="none"/><path d="M38 58 Q55 55 82 58" stroke="rgba(0,255,229,.4)" stroke-width="1"/><path d="M40 68 Q55 65 80 68" stroke="rgba(0,255,229,.4)" stroke-width="1"/>`,
+  },
+];
+
+const SCANNER = {
+  active: false,
+  poseIdx: 0,
+  phase: 'idle', // idle | countdown | capturing | done
+  phaseStart: 0,
+  poseCaptures: [], // per-pose: array of 21-landmark frames
+  allCaptures: [],  // flat: all averaged pose landmark sets
+  rafId: null,
+  qualityHistory: [],
+
+  // landmark quality: # of detected hands and spread of landmarks
+  computeQuality() {
+    if (!smoothHands.length) return 0;
+    const lms = smoothHands[0];
+    // Check spread — a valid open hand has wrist-to-middle-finger distance
+    const spread = lmDist(lms[0], lms[12]);
+    // Normalize loosely: anything above 0.15 in screen coords = good
+    return Math.min(1, spread / 0.22);
+  },
+
+  start() {
+    if (this.active) return;
+    this.active = true;
+    this.poseIdx = 0;
+    this.poseCaptures = [];
+    this.allCaptures = [];
+    this.qualityHistory = [];
+    document.getElementById('scan-overlay').classList.add('active');
+    document.getElementById('bscan').classList.add('scanning');
+    document.getElementById('bscan').textContent = '…';
+    this.startPose(0);
+  },
+
+  stop(completed) {
+    this.active = false;
+    this.phase = 'idle';
+    document.getElementById('scan-overlay').classList.remove('active');
+    document.getElementById('bscan').classList.remove('scanning');
+    document.getElementById('bscan').textContent = completed ? 'Rescan' : 'Scan';
+    document.getElementById('bscan').classList.toggle('done', !!completed);
+    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+  },
+
+  startPose(idx) {
+    this.poseIdx = idx;
+    this.phase = 'countdown';
+    this.phaseStart = performance.now();
+    this.poseCaptures[idx] = [];
+
+    const pose = SCAN_POSES[idx];
+    document.getElementById('scan-pose-name').textContent = pose.name;
+    document.getElementById('scan-instruction').textContent = pose.instruction;
+    document.getElementById('scan-sil').innerHTML = pose.silPath;
+
+    // Update dots
+    for (let i = 0; i < SCAN_POSES.length; i++) {
+      const d = document.getElementById('sdot-'+i);
+      d.className = 'sdot' + (i < idx ? ' done' : i === idx ? ' active' : '');
+    }
+
+    this.tick();
+  },
+
+  tick() {
+    if (!this.active) return;
+    this.rafId = requestAnimationFrame(() => this.tick());
+
+    const pose = SCAN_POSES[this.poseIdx];
+    const now = performance.now();
+    const elapsed = now - this.phaseStart;
+
+    // Quality
+    const q = this.computeQuality();
+    this.qualityHistory.push(q);
+    if (this.qualityHistory.length > 10) this.qualityHistory.shift();
+    const avgQ = this.qualityHistory.reduce((a,b)=>a+b,0) / this.qualityHistory.length;
+    document.getElementById('scan-quality-fill').style.width = (avgQ * 100) + '%';
+
+    if (this.phase === 'countdown') {
+      const total = pose.duration;
+      const remaining = Math.max(0, total - elapsed);
+      const secs = Math.ceil(remaining / 1000);
+
+      // Countdown arc
+      const arc = document.getElementById('scan-countdown-arc');
+      const frac = elapsed / total;
+      const circ = 163;
+      arc.style.strokeDashoffset = (circ * (1 - frac)).toFixed(2);
+      arc.style.stroke = 'rgba(0,255,229,.9)';
+      document.getElementById('scan-countdown-num').textContent = secs;
+
+      // Outer ring progress
+      const outerArc = document.getElementById('scan-arc');
+      outerArc.style.strokeDashoffset = (729 * (1 - frac)).toFixed(2);
+
+      if (elapsed >= total) {
+        // Switch to capture
+        this.phase = 'capturing';
+        this.phaseStart = performance.now();
+        arc.style.stroke = 'rgba(255,200,80,.9)';
+        document.getElementById('scan-instruction').textContent = '● Capturing…';
+      }
+
+    } else if (this.phase === 'capturing') {
+      const capDur = pose.captureDuration;
+      const capElapsed = now - this.phaseStart;
+
+      // Capture frames while hand is detected
+      if (smoothHands.length > 0) {
+        this.poseCaptures[this.poseIdx].push(
+          smoothHands[0].map(l => ({x:l.x, y:l.y, z:l.z}))
+        );
+      }
+
+      // Flash countdown num
+      document.getElementById('scan-countdown-num').textContent = '✦';
+
+      if (capElapsed >= capDur) {
+        this.finishPose();
+      }
+    }
+  },
+
+  finishPose() {
+    const frames = this.poseCaptures[this.poseIdx];
+    if (frames.length > 0) {
+      // Average all captured frames for this pose → single clean landmark set
+      const avg = Array.from({length:21}, (_,i) => {
+        const sx = frames.reduce((s,f)=>s+f[i].x, 0) / frames.length;
+        const sy = frames.reduce((s,f)=>s+f[i].y, 0) / frames.length;
+        const sz = frames.reduce((s,f)=>s+f[i].z, 0) / frames.length;
+        return {x:sx, y:sy, z:sz};
+      });
+      this.allCaptures.push(avg);
+    }
+
+    const next = this.poseIdx + 1;
+    if (next < SCAN_POSES.length) {
+      this.startPose(next);
+    } else {
+      this.complete();
+    }
+  },
+
+  complete() {
+    this.phase = 'done';
+    // Mark all dots done
+    for (let i = 0; i < SCAN_POSES.length; i++) {
+      document.getElementById('sdot-'+i).className = 'sdot done';
+    }
+    document.getElementById('scan-countdown-num').textContent = '✓';
+    document.getElementById('scan-instruction').textContent = 'Processing…';
+
+    setTimeout(() => {
+      this.stop(true);
+      this.buildModel();
+    }, 600);
+  },
+
+  buildModel() {
+    if (!this.allCaptures.length) return;
+
+    // ── 1. Extract bone ratios from each pose capture, average them
+    const ratioSets = this.allCaptures.map(lms => extractBoneRatios(lms));
+    const avgRatios = ratioSets[0].map((_, ri) =>
+      ratioSets.reduce((s, rs) => s + rs[ri], 0) / ratioSets.length
+    );
+
+    // ── 2. Build unified point cloud
+    // For each pose, project landmarks into world space (reusing update math)
+    const aspect = window.innerWidth / window.innerHeight;
+    const mirrorX = (facingMode === 'user');
+    cloudPoints = [];
+
+    this.allCaptures.forEach(lms => {
+      lms.forEach(lm => {
+        const nx = mirrorX ? (1 - lm.x) : lm.x;
+        cloudPoints.push({
+          x: (nx - 0.5) * 2 * aspect,
+          y: -(lm.y - 0.5) * 2,
+          z: -lm.z * 0.6,
+        });
+      });
+    });
+
+    // Add interpolated points between connected landmarks for denser cloud
+    this.allCaptures.forEach(lms => {
+      CONN.forEach(([ai, bi]) => {
+        const a = lms[ai], b = lms[bi];
+        for (let t = 0.25; t <= 0.75; t += 0.25) {
+          const nx = mirrorX ? (1 - (a.x + (b.x-a.x)*t)) : (a.x + (b.x-a.x)*t);
+          cloudPoints.push({
+            x: (nx - 0.5) * 2 * aspect,
+            y: -((a.y + (b.y-a.y)*t) - 0.5) * 2,
+            z: -((a.z + (b.z-a.z)*t)) * 0.6,
+          });
+        }
+      });
+    });
+
+    updateCloudMesh();
+
+    // ── 3. Compute display metrics
+    // Finger length ratios (relative to index finger = 1.0)
+    const FINGER_NAMES = ['Thumb','Index','Middle','Ring','Pinky'];
+    // Sum 3 segs per finger
+    const fingerLengths = [0,1,2,3,4].map(fi => {
+      const base = fi * 3;
+      return avgRatios.slice(base, base+3).reduce((s,v)=>s+v, 0);
+    });
+    const indexLen = fingerLengths[1] || 1;
+    const metrics = FINGER_NAMES.map((n,i) => ({
+      name: n,
+      ratio: (fingerLengths[i] / indexLen).toFixed(3),
+    }));
+
+    // ── 4. Save + show result
+    personalModel = { ratios: avgRatios, metrics, cloudCount: cloudPoints.length };
+    try { localStorage.setItem('hand_scan_v1', JSON.stringify(personalModel)); } catch(e){}
+
+    // Show result modal
+    const metricsEl = document.getElementById('scan-metrics');
+    metricsEl.innerHTML = metrics.map(m =>
+      `<div class="smet"><span class="smet-label">${m.name}</span><span class="smet-val">${m.ratio}×</span></div>`
+    ).join('') + `<div class="smet"><span class="smet-label">Cloud pts</span><span class="smet-val">${cloudPoints.length}</span></div>`;
+
+    document.getElementById('scan-result').classList.add('active');
+  },
+};
+
+document.getElementById('sr-discard').addEventListener('click', () => {
+  document.getElementById('scan-result').classList.remove('active');
+  cloudPoints = [];
+  updateCloudMesh();
+  personalModel = null;
+  try { localStorage.removeItem('hand_scan_v1'); } catch(e){}
+});
+
+document.getElementById('sr-apply').addEventListener('click', () => {
+  document.getElementById('scan-result').classList.remove('active');
+  // Enable cloud view automatically
+  showCloud = true;
+  document.getElementById('bcloud').classList.add('on');
+  cloudMesh.visible = true;
+  document.getElementById('cloud-badge').className = 'on';
+});
+
+document.getElementById('scan-cancel').addEventListener('click', () => {
+  SCANNER.stop(false);
+});
+
+document.getElementById('bscan').addEventListener('click', () => {
+  if (SCANNER.active) {
+    SCANNER.stop(false);
+  } else {
+    if (!smoothHands.length) {
+      document.getElementById('info').textContent = 'Show hand first';
+      setTimeout(() => { document.getElementById('info').textContent = 'Show hand to camera'; }, 2000);
+      return;
+    }
+    SCANNER.start();
+  }
+});
+
+// ─── White screen light source ───────────────────────────────────────────
+const whiteScreen = document.getElementById('white-screen');
+document.getElementById('bwhite').addEventListener('click', () => {
+  const on = whiteScreen.classList.toggle('active');
+  document.getElementById('bwhite').classList.toggle('on', on);
+  // Keep screen awake while white screen is on (where supported)
+  if (on && navigator.wakeLock) {
+    navigator.wakeLock.request('screen').catch(() => {});
+  }
+});
+// Tap white screen to dismiss
+whiteScreen.addEventListener('click', () => {
+  whiteScreen.classList.remove('active');
+  document.getElementById('bwhite').classList.remove('on');
+});
+
+// Boot
+initDetector();
+</script>
+</body>
+</html>
