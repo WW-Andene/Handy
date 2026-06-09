@@ -1,0 +1,157 @@
+package com.arhand.render
+
+import android.graphics.Bitmap
+import android.opengl.GLES30
+import android.opengl.GLSurfaceView
+import android.opengl.Matrix
+import com.arhand.mocap.LoadedAsset
+import com.arhand.mocap.RetargetResult
+import com.arhand.tracking.HandLandmarks
+import com.arhand.util.PerfMonitor
+import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.opengles.GL10
+
+/**
+ * Main OpenGL ES 3.0 renderer.
+ * GLSurfaceView.Renderer — runs on the GL thread, separate from tracking and UI threads.
+ *
+ * Pipeline: onDrawFrame → drawCameraPassthrough → updateHandMeshes → drawScene
+ * Camera: Orthographic (matches THREE.OrthographicCamera from HTML prototype)
+ * MVP: calculated manually via Matrix.orthoM + aspect ratio
+ *
+ * [onAspectChanged] is invoked from the GL thread whenever the surface dimensions change.
+ * AppViewModel wires this to [AppViewModel.currentAspect] so the scanner coroutine always
+ * uses the real device aspect ratio instead of a hardcoded 9/16 constant.
+ */
+class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer {
+
+    // Shared state updated from tracking thread (volatile for visibility)
+    @Volatile var handsData: List<HandLandmarks> = emptyList()
+    @Volatile var renderMode: RenderMode = RenderMode.MESH
+    @Volatile var torchOn: Boolean = true
+    @Volatile var showCloud: Boolean = false
+    @Volatile var mirrorX: Boolean = true
+    @Volatile var scanCloudPoints: FloatArray? = null
+    @Volatile var depthMeshPositions: FloatArray? = null
+
+    /** When non-null, [SkinnedMeshRenderer] replaces [HandRenderer] for the primary hand. */
+    @Volatile var loadedAsset: LoadedAsset? = null
+        set(value) {
+            field = value
+            if (value != null) skinnedMeshRenderer.updateAsset(value)
+        }
+
+    /** Latest retarget result — updated by AppViewModel every tracking frame. */
+    @Volatile var latestRetargetResult: RetargetResult? = null
+        set(value) {
+            field = value
+            if (value != null) skinnedMeshRenderer.updatePose(value)
+        }
+
+    /**
+     * Callback invoked on the GL thread from [onSurfaceChanged] with the real
+     * surface aspect ratio (width / height).  Set by AppViewModel.
+     */
+    var onAspectChanged: ((Float) -> Unit)? = null
+
+    private val handRenderers = arrayOf(HandRenderer(), HandRenderer())
+    private val pointCloudRenderer = PointCloudRenderer()
+    private val depthMeshRenderer = DepthMeshRenderer()
+    private val cameraPassthrough = CameraPassthroughRenderer()
+    private val skinnedMeshRenderer = SkinnedMeshRenderer()
+
+    private val projMatrix = FloatArray(16)
+    private val viewMatrix = FloatArray(16)
+    private var aspect = 1f
+
+    private var timeMs = 0L
+
+    /**
+     * Called from the tracking coroutine whenever a new camera Bitmap is available.
+     * Thread-safe: just sets a volatile reference; the GL thread reads it in onDrawFrame.
+     */
+    fun submitCameraFrame(bitmap: Bitmap) {
+        cameraPassthrough.latestBitmap = bitmap
+    }
+
+    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        GLES30.glClearColor(0f, 0f, 0f, 1f)
+        GLES30.glEnable(GLES30.GL_DEPTH_TEST)
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+
+        cameraPassthrough.init()
+        handRenderers.forEach { it.init() }
+        pointCloudRenderer.init()
+        depthMeshRenderer.init()
+        skinnedMeshRenderer.init()
+
+        Matrix.setLookAtM(viewMatrix, 0,
+            0f, 0f, 5f,
+            0f, 0f, 0f,
+            0f, 1f, 0f
+        )
+    }
+
+    override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        GLES30.glViewport(0, 0, width, height)
+        aspect = width.toFloat() / height.toFloat()
+        Matrix.orthoM(projMatrix, 0, -aspect, aspect, -1f, 1f, -10f, 10f)
+
+        // Publish real aspect to AppViewModel so scanner never uses a hardcoded value
+        onAspectChanged?.invoke(aspect)
+    }
+
+    override fun onDrawFrame(gl: GL10?) {
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
+
+        cameraPassthrough.mirrorX = mirrorX
+        cameraPassthrough.draw()
+
+        timeMs = System.currentTimeMillis()
+        val timeSec = (timeMs % 100000L) / 1000f
+
+        val hands = handsData
+        val assetLoaded = loadedAsset != null
+
+        for (i in hands.indices) {
+            val lms = hands[i]
+            handRenderers[i].update(lms, aspect, mirrorX)
+            if (assetLoaded && i == 0) {
+                // Primary hand: draw procedural hand as ghost at reduced opacity if enabled,
+                // then draw skinned asset on top. Secondary hands always use HandRenderer.
+                if (skinnedMeshRenderer.showGhostOverlay) {
+                    handRenderers[i].draw(viewMatrix, projMatrix, RenderMode.SKELETON, torchOn, timeSec)
+                }
+                skinnedMeshRenderer.draw(viewMatrix, projMatrix, torchOn, timeSec)
+            } else {
+                handRenderers[i].draw(viewMatrix, projMatrix, renderMode, torchOn, timeSec)
+            }
+        }
+        for (i in hands.size until handRenderers.size) {
+            handRenderers[i].clear()
+        }
+
+        if (showCloud) {
+            scanCloudPoints?.let { pointCloudRenderer.update(it) }
+            pointCloudRenderer.draw(viewMatrix, projMatrix)
+        }
+
+        depthMeshPositions?.let {
+            depthMeshRenderer.update(it)
+            depthMeshRenderer.draw(viewMatrix, projMatrix, renderMode)
+        }
+
+        perfMonitor.onFrame()
+    }
+}
+
+enum class RenderMode {
+    MESH,
+    WIREFRAME,
+    SKELETON,
+    /** Camera passthrough visible; loaded GLB asset rendered on top via live retargeted rotations. */
+    ASSET_3D,
+    /** Asset renders as screen-space overlay; IK bone endpoints snap to projected fingertip coords. */
+    ASSET_2D
+}
