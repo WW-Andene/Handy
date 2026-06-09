@@ -41,6 +41,9 @@ android {
 }
 
 dependencies {
+    // AppCompat — required for theme base
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+
     // MediaPipe Tasks Vision — hand tracking, offline
     implementation 'com.google.mediapipe:tasks-vision:0.10.14'
 
