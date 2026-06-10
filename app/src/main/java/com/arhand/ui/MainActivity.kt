@@ -14,6 +14,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.arhand.mocap.OscSchema
+import com.arhand.mocap.OscMode
 import com.arhand.render.RenderMode
 import com.arhand.scanner.Scanner
 import java.io.File
@@ -54,6 +56,7 @@ fun HandyApp(vm: AppViewModel, onShareGlb: () -> Unit) {
     val perfState          by vm.perfMonitor.state.collectAsStateWithLifecycle()
     val scanStatus         by vm.scanner.status.collectAsStateWithLifecycle()
     val depthMeshPositions by vm.depthMeshPositions.collectAsStateWithLifecycle()
+    val processedHands     by vm.handPipeline.processed.collectAsStateWithLifecycle()
 
     var showResult by remember { mutableStateOf(false) }
 
@@ -82,11 +85,20 @@ fun HandyApp(vm: AppViewModel, onShareGlb: () -> Unit) {
 
         if (uiState.showSplash) SplashScreen()
 
-        if (!uiState.showSplash) {
+        // E6 — Onboarding overlay: shown after splash on first launch
+        if (!uiState.showSplash && uiState.showOnboarding) {
+            OnboardingScreen(onDismiss = { vm.dismissOnboarding() })
+        }
+
+        if (!uiState.showSplash && !uiState.showOnboarding) {
             HudOverlay(
-                perf       = perfState,
-                renderMode = uiState.renderMode.name,
-                torchOn    = uiState.torchOn
+                perf           = perfState,
+                renderMode     = uiState.renderMode.name,
+                torchOn        = uiState.torchOn,
+                landmarkCount  = processedHands.sumOf { it.landmarks.size },
+                activeSlots    = processedHands.map { it.slotIndex }.sorted()
+                                     .joinToString(",").ifEmpty { "--" },
+                activeGesture  = uiState.activeGesture
             )
         }
 
@@ -94,23 +106,65 @@ fun HandyApp(vm: AppViewModel, onShareGlb: () -> Unit) {
             ScanOverlay(status = scanStatus, onCancel = { vm.cancelScan() })
         }
 
-        if (!uiState.showSplash && !uiState.scanActive) {
+        if (!uiState.showSplash && !uiState.showOnboarding && !uiState.scanActive) {
             Column(modifier = Modifier.align(Alignment.BottomCenter)) {
+                // G2 — DepthScannerPanel is now always shown (not gated by depthApiAvailable)
+                // because the neural recon toggle is independent of ARCore Depth API.
+                DepthScannerPanel(
+                    depthMode             = uiState.depthMode,
+                    depthConfidence       = uiState.depthConfidence,
+                    onToggleDepth         = if (uiState.depthApiAvailable) vm::toggleDepth else ({}),
+                    depthApiAvailable     = uiState.depthApiAvailable,
+                    neuralReconEnabled    = uiState.neuralReconEnabled,
+                    neuralDiagnostics     = uiState.neuralReconDiagnostics,
+                    onToggleNeuralRecon   = vm::toggleNeuralRecon,
+                    photoStereoEnabled    = uiState.photoStereoEnabled,
+                    photoStereoFrameCount = uiState.photoStereoFrameCount,
+                    photoStereoComplete   = uiState.photoStereoComplete,
+                    isFrontCamera         = uiState.isFrontCamera,
+                    onTogglePhotoStereo   = vm::togglePhotoStereo
+                )
+                OscPanel(
+                    isStreaming    = uiState.isOscStreaming,
+                    isReceiving    = uiState.isOscReceiving,
+                    activeSchema   = uiState.oscSchema,
+                    oscMode        = uiState.oscMode,
+                    receivePort    = uiState.oscReceivePort,
+                    onModeSelect   = vm::setOscMode,
+                    onSchemaSelect = vm::setOscSchema,
+                    onToggle       = {
+                        when (uiState.oscMode) {
+                            com.arhand.mocap.OscMode.SEND ->
+                                if (uiState.isOscStreaming) vm.stopOscStreaming()
+                                else vm.startOscStreaming()
+                            com.arhand.mocap.OscMode.RECEIVE ->
+                                if (uiState.isOscReceiving) vm.stopOscReceiving()
+                                else vm.startOscReceiving()
+                        }
+                    }
+                )
                 ControlPanel(
-                    renderMode  = uiState.renderMode.name,
-                    torchOn     = uiState.torchOn,
-                    showCloud   = uiState.showCloud,
-                    scanActive  = uiState.scanActive,
-                    hasModel    = uiState.hasStoredModel,
-                    onMode      = vm::toggleRenderMode,
-                    onTorch     = vm::toggleTorch,
-                    onCloud     = vm::toggleCloud,
-                    onCamera    = vm::switchCamera,
-                    onScan      = {
+                    renderMode     = uiState.renderMode.name,
+                    torchOn        = uiState.torchOn,
+                    showCloud      = uiState.showCloud,
+                    scanActive     = uiState.scanActive,
+                    hasModel       = uiState.hasStoredModel,
+                    isRecording    = uiState.isRecording,
+                    liveMeshActive = uiState.liveMeshActive,
+                    onMode         = vm::toggleRenderMode,
+                    onTorch        = vm::toggleTorch,
+                    onCloud        = vm::toggleCloud,
+                    onCamera       = vm::switchCamera,
+                    onScan         = {
                         if (uiState.hasStoredModel) showResult = true
                         else vm.startScan()
                     },
-                    onViewModel = { showResult = true }
+                    onViewModel    = { showResult = true },
+                    onRecord       = {
+                        if (uiState.isRecording) vm.stopRecordingAndExport()
+                        else vm.startRecording()
+                    },
+                    onLiveMesh     = vm::toggleLiveMesh
                 )
             }
         }
@@ -121,6 +175,9 @@ fun HandyApp(vm: AppViewModel, onShareGlb: () -> Unit) {
                 glbPath       = uiState.exportedGlbPath,
                 poseScores    = scanStatus.poseScores,
                 meshPositions = depthMeshPositions,
+                biometrics         = uiState.handBiometrics,
+                biometricHistory   = uiState.biometricHistory,
+                jointRomData       = uiState.jointRomData,
                 onShare       = { onShareGlb(); showResult = false },
                 onRescan      = { showResult = false; vm.startScan() },
                 onDismiss     = { showResult = false }

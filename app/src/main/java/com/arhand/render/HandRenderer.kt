@@ -27,18 +27,30 @@ class HandRenderer {
     // Skin color — rgba(210,170,120,1) in float
     private val skinColor = floatArrayOf(0.824f, 0.667f, 0.471f)
 
+    // Persistent VAO + VBOs for mesh drawing — allocated once in init(), reused every frame.
+    // Using a single VAO for all mesh parts; geometry is re-uploaded per-part via glBufferData.
+    private val meshVao = IntArray(1)
+    private val meshVbo = IntArray(2)  // [0]=positions, [1]=normals
+    private val meshIbo = IntArray(1)
+
     fun init() {
         phongProgram = compileProgram(ShaderPrograms.PHONG_VERT, ShaderPrograms.PHONG_FRAG)
         basicProgram = compileProgram(ShaderPrograms.BASIC_VERT, ShaderPrograms.BASIC_FRAG)
         lineProgram  = compileProgram(ShaderPrograms.LINE_VERT,  ShaderPrograms.LINE_FRAG)
+
+        GLES30.glGenVertexArrays(1, meshVao, 0)
+        GLES30.glGenBuffers(2, meshVbo, 0)
+        GLES30.glGenBuffers(1, meshIbo, 0)
     }
 
     private var currentLms: HandLandmarks? = null
     private var currentAspect = 1f
+    private var currentMirrorX = true
 
     fun update(lms: HandLandmarks, aspect: Float, mirrorX: Boolean) {
         currentLms = lms
         currentAspect = aspect
+        currentMirrorX = mirrorX
         // Rebuild VBOs — deferred to draw() on GL thread
     }
 
@@ -50,14 +62,17 @@ class HandRenderer {
 
         // Convert landmarks to world-space Vec3
         val pts = lms.map { lm ->
-            val (x, y, z) = landmarkToWorld(lm, currentAspect, mirrorX = true)
+            val (x, y, z) = landmarkToWorld(lm, currentAspect, mirrorX = currentMirrorX)
             Vec3(x, y, z)
         }
 
         when (mode) {
-            RenderMode.MESH      -> drawMesh(pts, lms, view, proj, torchOn, timeSec)
+            RenderMode.MESH,
+            RenderMode.LIVE_MESH -> drawMesh(pts, lms, view, proj, torchOn, timeSec)
             RenderMode.WIREFRAME -> drawWireframe(pts, view, proj)
-            RenderMode.SKELETON  -> drawSkeleton(pts, lms, view, proj, timeSec)
+            RenderMode.SKELETON,
+            RenderMode.ASSET_3D,
+            RenderMode.ASSET_2D  -> drawSkeleton(pts, lms, view, proj, timeSec)
         }
     }
 
@@ -73,6 +88,9 @@ class HandRenderer {
         normalMatrix[6] = model[8]; normalMatrix[7] = model[9]; normalMatrix[8] = model[10]
 
         setMatrixUniforms(phongProgram, model, view, proj)
+        GLES30.glUniformMatrix3fv(
+            GLES30.glGetUniformLocation(phongProgram, "uNormalMatrix"), 1, false, normalMatrix, 0
+        )
         setLightingUniforms(phongProgram, torchOn, timeSec, pts)
 
         GLES30.glUniform3fv(GLES30.glGetUniformLocation(phongProgram, "uBaseColor"), 1, skinColor, 0)
@@ -210,14 +228,10 @@ class HandRenderer {
     private fun drawMeshData(prog: Int, mesh: HandMeshBuilder.MeshData) {
         if (mesh.positions.isEmpty()) return
 
-        val vao = IntArray(1); GLES30.glGenVertexArrays(1, vao, 0)
-        val vbo = IntArray(2); GLES30.glGenBuffers(2, vbo, 0)
-        val ibo = IntArray(1); GLES30.glGenBuffers(1, ibo, 0)
-
-        GLES30.glBindVertexArray(vao[0])
+        GLES30.glBindVertexArray(meshVao[0])
 
         // Positions
-        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo[0])
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, meshVbo[0])
         val posBuf = toFloatBuffer(mesh.positions)
         GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, mesh.positions.size * 4, posBuf, GLES30.GL_DYNAMIC_DRAW)
         val posLoc = GLES30.glGetAttribLocation(prog, "aPosition")
@@ -226,7 +240,7 @@ class HandRenderer {
 
         // Normals
         if (mesh.normals.isNotEmpty()) {
-            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo[1])
+            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, meshVbo[1])
             val normBuf = toFloatBuffer(mesh.normals)
             GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, mesh.normals.size * 4, normBuf, GLES30.GL_DYNAMIC_DRAW)
             val normLoc = GLES30.glGetAttribLocation(prog, "aNormal")
@@ -237,16 +251,14 @@ class HandRenderer {
         }
 
         // Indices
-        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ibo[0])
+        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, meshIbo[0])
         val idxBuf = toIntBuffer(mesh.indices)
         GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, mesh.indices.size * 4, idxBuf, GLES30.GL_DYNAMIC_DRAW)
 
         GLES30.glDrawElements(GLES30.GL_TRIANGLES, mesh.indices.size, GLES30.GL_UNSIGNED_INT, 0)
 
         GLES30.glBindVertexArray(0)
-        GLES30.glDeleteVertexArrays(1, vao, 0)
-        GLES30.glDeleteBuffers(2, vbo, 0)
-        GLES30.glDeleteBuffers(1, ibo, 0)
+        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, 0)
     }
 
     private fun drawLineStrip(pts: List<Vec3>) {

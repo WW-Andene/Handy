@@ -68,7 +68,15 @@ class OneEuroFilter(
     /**
      * Smooth a list of 21 landmarks. Returns new smoothed list.
      */
-    fun smooth(lms: List<Landmark>, nowMs: Long): List<Landmark> {
+    fun smooth(lms: List<Landmark>, nowMs: Long): List<Landmark> =
+        smooth(lms, nowMs, minCutoffXY, betaXY)
+
+    /**
+     * A2 — Confidence-weighted variant: caller supplies effective cutoff/beta.
+     * When confidence is low, use higher minCutoff + lower beta (more aggressive filtering).
+     * When confidence is high, use base params (more responsive).
+     */
+    fun smooth(lms: List<Landmark>, nowMs: Long, effectiveCutoffXY: Float, effectiveBetaXY: Float): List<Landmark> {
         ensureInit(lms.size, nowMs)
         val st = states!!
         return lms.mapIndexed { i, lm ->
@@ -81,9 +89,9 @@ class OneEuroFilter(
                 lm
             } else {
                 val s = st[i]!!
-                val sx = filterScalar(s.x, lm.x, nowMs, minCutoffXY, betaXY)
-                val sy = filterScalar(s.y, lm.y, nowMs, minCutoffXY, betaXY)
-                val sz = filterScalar(s.z, lm.z, nowMs, minCutoffZ, betaZ)
+                val sx = filterScalar(s.x, lm.x, nowMs, effectiveCutoffXY, effectiveBetaXY)
+                val sy = filterScalar(s.y, lm.y, nowMs, effectiveCutoffXY, effectiveBetaXY)
+                val sz = filterScalar(s.z, lm.z, nowMs, minCutoffZ,        betaZ)
                 lm.copy(x = sx, y = sy, z = sz)
             }
         }

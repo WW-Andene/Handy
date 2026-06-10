@@ -28,6 +28,8 @@ class OcclusionEngine {
         const val VEL_EXTRAP_MAX_SEC = 0.20f   // 200ms ≈ 6 frames at 30fps
         const val OCC_PROB_EMA_ALPHA = 0.4f
         const val OCC_PROB_THRESHOLD = 0.55f
+        /** A6: Landmarks with MediaPipe visibility below this are pre-gated as occluded. */
+        const val VISIBILITY_THRESHOLD = 0.5f
     }
 
     // Per-landmark: EMA occlusion probability
@@ -183,10 +185,21 @@ class OcclusionEngine {
     /**
      * Apply occlusion inference to a full landmark list.
      * Returns new list with inferred landmarks marked.
+     *
+     * A6 — Visibility score gating: landmarks with MediaPipe visibility < 0.5 are
+     * pre-marked as occluded before the geometric detectOcclusion pass. This filters
+     * out landmarks the model itself considers unreliable, reducing false-positive
+     * occlusion detections from geometric heuristics alone.
      */
     fun applyInference(lms: List<Landmark>, confidence: Float, nowMs: Long): List<Landmark> {
         if (lms.size < 21 || confidence < 0.3f) return lms
         val occluded = detectOcclusion(lms)
+
+        // A6: Pre-gate with visibility score — override geometric result when model is uncertain
+        for (i in 0 until 21) {
+            if (lms[i].visibility < VISIBILITY_THRESHOLD) occluded[i] = true
+        }
+
         updateVelocity(lms, occluded, nowMs)
         val result = lms.toMutableList()
         for (i in 0 until 21) {

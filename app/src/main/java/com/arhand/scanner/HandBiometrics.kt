@@ -72,63 +72,80 @@ data class HandBiometrics(
         ): HandBiometrics? {
             if (frames.isEmpty()) return null
 
-            // Pick the highest-quality frame
-            val (lms, quality) = frames.maxByOrNull { it.second } ?: return null
-            if (lms.size < 21) return null
+            // D1 — Multi-frame biometric averaging with outlier rejection.
+            // A single frame has ±8–12% error due to MediaPipe's Z proxy.
+            // Strategy: take the top-10 frames by quality score, compute each metric
+            // per frame, then discard outliers beyond 1.5×IQR and return the trimmed mean.
+            // Expected error reduction: ±3–5%.
 
-            // Convert all 21 landmarks to world-space Vec3
-            val world: List<Vec3> = lms.map { lm ->
-                val (wx, wy, wz) = landmarkToWorld(lm, aspect, mirrorX = false)
-                Vec3(wx, wy, wz)
+            val validFrames = frames
+                .filter { (lms, _) -> lms.size >= 21 }
+                .sortedByDescending { (_, q) -> q }
+                .take(10)
+
+            if (validFrames.isEmpty()) return null
+
+            val bestQuality = validFrames.first().second
+
+            // Helper: convert one frame's landmarks to world-space, measure one metric
+            fun measureAll(lms: HandLandmarks): FloatArray {
+                val world = lms.map { lm ->
+                    val (wx, wy, wz) = landmarkToWorld(lm, aspect, mirrorX = false)
+                    Vec3(wx, wy, wz)
+                }
+                fun d(a: Int, b: Int) = (world[a] - world[b]).length()
+                val palmWidth = d(LM.INDEX_MCP, LM.PINKY_MCP)
+                return floatArrayOf(
+                    palmWidth,
+                    d(LM.THUMB_CMC, LM.THUMB_MCP) + d(LM.THUMB_MCP, LM.THUMB_IP)  + d(LM.THUMB_IP,   LM.THUMB_TIP),
+                    d(LM.INDEX_MCP, LM.INDEX_PIP)  + d(LM.INDEX_PIP, LM.INDEX_DIP)  + d(LM.INDEX_DIP,  LM.INDEX_TIP),
+                    d(LM.MIDDLE_MCP,LM.MIDDLE_PIP) + d(LM.MIDDLE_PIP,LM.MIDDLE_DIP) + d(LM.MIDDLE_DIP, LM.MIDDLE_TIP),
+                    d(LM.RING_MCP,  LM.RING_PIP)   + d(LM.RING_PIP,  LM.RING_DIP)   + d(LM.RING_DIP,   LM.RING_TIP),
+                    d(LM.PINKY_MCP, LM.PINKY_PIP)  + d(LM.PINKY_PIP, LM.PINKY_DIP)  + d(LM.PINKY_DIP,  LM.PINKY_TIP),
+                    d(LM.THUMB_TIP, LM.PINKY_TIP),
+                    d(LM.WRIST,     LM.INDEX_MCP)
+                )
             }
 
-            fun dist(a: Int, b: Int): Float = (world[a] - world[b]).length()
+            // Collect per-metric samples across all top frames
+            val allMeasures = validFrames.map { (lms, _) -> measureAll(lms) }
+            val numMetrics = allMeasures[0].size
 
-            // Palm width: INDEX_MCP → PINKY_MCP
-            val palmWidth = dist(LM.INDEX_MCP, LM.PINKY_MCP)
+            // IQR trimmed mean per metric
+            fun trimmedMean(metricIdx: Int): Float {
+                val vals = allMeasures.map { it[metricIdx] }.sorted()
+                if (vals.size < 4) return vals.average().toFloat()
+                val q1 = vals[vals.size / 4]
+                val q3 = vals[vals.size * 3 / 4]
+                val iqr = q3 - q1
+                val lo = q1 - 1.5f * iqr
+                val hi = q3 + 1.5f * iqr
+                val kept = vals.filter { it in lo..hi }
+                return if (kept.isEmpty()) vals.average().toFloat() else kept.average().toFloat()
+            }
 
-            // Finger lengths: sum of 3 phalanx segments each
-            val thumbLength  = dist(LM.THUMB_CMC,  LM.THUMB_MCP)  +
-                               dist(LM.THUMB_MCP,  LM.THUMB_IP)   +
-                               dist(LM.THUMB_IP,   LM.THUMB_TIP)
-
-            val indexLength  = dist(LM.INDEX_MCP,  LM.INDEX_PIP)  +
-                               dist(LM.INDEX_PIP,  LM.INDEX_DIP)  +
-                               dist(LM.INDEX_DIP,  LM.INDEX_TIP)
-
-            val middleLength = dist(LM.MIDDLE_MCP, LM.MIDDLE_PIP) +
-                               dist(LM.MIDDLE_PIP, LM.MIDDLE_DIP) +
-                               dist(LM.MIDDLE_DIP, LM.MIDDLE_TIP)
-
-            val ringLength   = dist(LM.RING_MCP,   LM.RING_PIP)   +
-                               dist(LM.RING_PIP,   LM.RING_DIP)   +
-                               dist(LM.RING_DIP,   LM.RING_TIP)
-
-            val pinkyLength  = dist(LM.PINKY_MCP,  LM.PINKY_PIP)  +
-                               dist(LM.PINKY_PIP,  LM.PINKY_DIP)  +
-                               dist(LM.PINKY_DIP,  LM.PINKY_TIP)
-
-            // Hand span: thumb tip → pinky tip
-            val handSpan = dist(LM.THUMB_TIP, LM.PINKY_TIP)
-
-            // Knuckle breadth: INDEX_MCP → PINKY_MCP + 12% soft-tissue correction
-            val knuckleBreadth = palmWidth * 1.12f
-
-            // Wrist circumference proxy: π × (1.4 × wrist→index_mcp)
-            val wristDiameter  = dist(LM.WRIST, LM.INDEX_MCP) * 1.4f
+            val palmWidth          = trimmedMean(0)
+            val thumbLength        = trimmedMean(1)
+            val indexLength        = trimmedMean(2)
+            val middleLength       = trimmedMean(3)
+            val ringLength         = trimmedMean(4)
+            val pinkyLength        = trimmedMean(5)
+            val handSpan           = trimmedMean(6)
+            val wristDiameter      = trimmedMean(7) * 1.4f
+            val knuckleBreadth     = palmWidth * 1.12f
             val wristCircumference = (PI * wristDiameter).toFloat()
 
             return HandBiometrics(
-                palmWidth         = palmWidth,
-                thumbLength       = thumbLength,
-                indexLength       = indexLength,
-                middleLength      = middleLength,
-                ringLength        = ringLength,
-                pinkyLength       = pinkyLength,
-                handSpan          = handSpan,
-                knuckleBreadth    = knuckleBreadth,
+                palmWidth          = palmWidth,
+                thumbLength        = thumbLength,
+                indexLength        = indexLength,
+                middleLength       = middleLength,
+                ringLength         = ringLength,
+                pinkyLength        = pinkyLength,
+                handSpan           = handSpan,
+                knuckleBreadth     = knuckleBreadth,
                 wristCircumference = wristCircumference,
-                sourcePoseQuality = quality
+                sourcePoseQuality  = bestQuality
             )
         }
 
@@ -137,25 +154,7 @@ data class HandBiometrics(
 
         /** Format a world-space value as "XX.X mm" for display. */
         fun fmtMm(worldUnits: Float): String = "%.1f mm".format(toMm(worldUnits))
-    }
 
-    /** Serialise to a compact JSON string for DataStore persistence. */
-    fun toJson(): String = """
-        {
-          "palmWidth":$palmWidth,
-          "thumbLength":$thumbLength,
-          "indexLength":$indexLength,
-          "middleLength":$middleLength,
-          "ringLength":$ringLength,
-          "pinkyLength":$pinkyLength,
-          "handSpan":$handSpan,
-          "knuckleBreadth":$knuckleBreadth,
-          "wristCircumference":$wristCircumference,
-          "sourcePoseQuality":$sourcePoseQuality
-        }
-    """.trimIndent()
-
-    companion object {
         /** Deserialise from a toJson() string. Returns null on any parse failure. */
         fun fromJson(json: String): HandBiometrics? = try {
             fun extract(key: String): Float {
@@ -176,5 +175,47 @@ data class HandBiometrics(
                 sourcePoseQuality  = extract("sourcePoseQuality")
             )
         } catch (_: Exception) { null }
+
+        /**
+         * D2 — Compute a calibrated world-to-mm scale factor from a credit card
+         * reference measurement.
+         *
+         * The user holds a standard credit card (ISO 7810 ID-1: 85.6 × 54.0 mm) in
+         * the frame and the app measures the card's long axis in world coordinates.
+         * The ratio of the known real width to the measured world width yields the
+         * scale factor that replaces [WORLD_TO_MM] for all subsequent measurements.
+         *
+         * @param measuredCardWidthWorldUnits  Long axis of the card in world units,
+         *        as measured from landmark or bounding-box detection.
+         * @return Calibrated world-to-mm factor, or null if the measurement is
+         *         outside a plausible range (guards against obviously wrong inputs).
+         *
+         * Plausibility gate: the factor must be in [300, 2500] — corresponding to
+         * a palm size of roughly 60–240mm in world-unit terms, which covers all
+         * realistic hand sizes and camera distances.
+         */
+        fun calibrateFromCard(measuredCardWidthWorldUnits: Float): Float? {
+            if (measuredCardWidthWorldUnits <= 0f) return null
+            val CARD_WIDTH_MM = 85.6f
+            val scale = CARD_WIDTH_MM / measuredCardWidthWorldUnits
+            return if (scale in 300f..2500f) scale else null
+        }
     }
+
+    /** Serialise to a compact JSON string for DataStore persistence. */
+    fun toJson(): String = """
+        {
+          "palmWidth":$palmWidth,
+          "thumbLength":$thumbLength,
+          "indexLength":$indexLength,
+          "middleLength":$middleLength,
+          "ringLength":$ringLength,
+          "pinkyLength":$pinkyLength,
+          "handSpan":$handSpan,
+          "knuckleBreadth":$knuckleBreadth,
+          "wristCircumference":$wristCircumference,
+          "sourcePoseQuality":$sourcePoseQuality
+        }
+    """.trimIndent()
+
 }

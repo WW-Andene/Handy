@@ -136,7 +136,7 @@ class MotionRecorder(
 
     /** Stop accepting new frames. Does not clear buffered data. */
     fun stop() {
-        isRecording = false
+        synchronized(frames) { isRecording = false }
     }
 
     /** Stop recording and clear all buffered frames. */
@@ -246,16 +246,20 @@ class MotionRecorder(
         // Root has position + rotation channels for root motion
         w.write("\tCHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\n")
 
-        writeFingerChain(w, "Thumb",  listOf("ThumbCMC", "ThumbMCP", "ThumbIP"),   depth = 1)
-        writeFingerChain(w, "Index",  listOf("IndexMCP", "IndexPIP", "IndexDIP"),   depth = 1)
-        writeFingerChain(w, "Middle", listOf("MiddleMCP", "MiddlePIP", "MiddleDIP"), depth = 1)
-        writeFingerChain(w, "Ring",   listOf("RingMCP", "RingPIP", "RingDIP"),       depth = 1)
-        writeFingerChain(w, "Pinky",  listOf("PinkyMCP", "PinkyPIP", "PinkyDIP"),   depth = 1)
+        // C3 — Fingertip end-sites: add TIP as the final named joint in each chain.
+        // Blender's BVH importer creates a stub bone for each named End Site, enabling
+        // IK chains and finger-tip constraint targets for each finger.
+        writeFingerChain(w, "Thumb",  listOf("ThumbCMC",  "ThumbMCP",  "ThumbIP",  "ThumbTip"),  depth = 1)
+        writeFingerChain(w, "Index",  listOf("IndexMCP",  "IndexPIP",  "IndexDIP",  "IndexTip"),  depth = 1)
+        writeFingerChain(w, "Middle", listOf("MiddleMCP", "MiddlePIP", "MiddleDIP", "MiddleTip"), depth = 1)
+        writeFingerChain(w, "Ring",   listOf("RingMCP",   "RingPIP",   "RingDIP",   "RingTip"),   depth = 1)
+        writeFingerChain(w, "Pinky",  listOf("PinkyMCP",  "PinkyPIP",  "PinkyDIP",  "PinkyTip"),  depth = 1)
 
         w.write("}\n")
     }
 
     private fun writeFingerChain(w: FileWriter, finger: String, joints: List<String>, depth: Int) {
+        if (joints.isEmpty()) return
         val indent = "\t".repeat(depth)
 
         // Map display name back to joint index for bone length lookup
@@ -263,31 +267,43 @@ class MotionRecorder(
             JOINT_NAMES.entries.firstOrNull { it.value == name }?.key
         }
 
-        joints.forEachIndexed { i, jointName ->
-            val jointIdx = jointIndexForName(jointName)
-            val len      = BONE_LENGTH[jointIdx] ?: 0.03f
-            val offset   = "%.4f %.4f %.4f".format(0f, len, 0f)   // offset along +Y (bone axis)
+        val jointName = joints[0]
+        val jointIdx  = jointIndexForName(jointName)
+        val len       = BONE_LENGTH[jointIdx] ?: 0.03f
+        val offset    = "%.4f %.4f %.4f".format(0f, len, 0f)
 
-            w.write("${indent}JOINT $jointName\n")
-            w.write("$indent{\n")
-            w.write("$indent\tOFFSET $offset\n")
+        // C3: Tip joints (ThumbTip, IndexTip, etc.) are written as named stub bones
+        // with CHANNELS 0 — they appear in Blender as IK-target bones without requiring
+        // motion data channels in the MOTION section.
+        val isTipJoint = jointName.endsWith("Tip")
+
+        w.write("${indent}JOINT $jointName\n")
+        w.write("$indent{\n")
+        w.write("$indent\tOFFSET $offset\n")
+
+        if (isTipJoint) {
+            // Named end-site stub: 0 channels, leaf End Site
+            w.write("$indent\tCHANNELS 0\n")
+            val endLen = len * 0.6f
+            w.write("$indent\tEnd Site\n")
+            w.write("$indent\t{\n")
+            w.write("$indent\t\tOFFSET 0.0000 %.4f 0.0000\n".format(endLen))
+            w.write("$indent\t}\n")
+        } else if (joints.size > 1) {
             w.write("$indent\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
-
-            if (i < joints.size - 1) {
-                // Recurse into next joint in chain
-                writeFingerChain(w, finger, joints.subList(i + 1, joints.size), depth + 1)
-            } else {
-                // Leaf — append End Site
-                val endLen = len * 0.6f
-                w.write("$indent\tEnd Site\n")
-                w.write("$indent\t{\n")
-                w.write("$indent\t\tOFFSET 0.0000 %.4f 0.0000\n".format(endLen))
-                w.write("$indent\t}\n")
-            }
-
-            w.write("$indent}\n")
-            return   // only process first joint; recursion handles the rest
+            // Recurse into the remaining joints in this finger chain
+            writeFingerChain(w, finger, joints.subList(1, joints.size), depth + 1)
+        } else {
+            w.write("$indent\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+            // Leaf — append End Site
+            val endLen = len * 0.6f
+            w.write("$indent\tEnd Site\n")
+            w.write("$indent\t{\n")
+            w.write("$indent\t\tOFFSET 0.0000 %.4f 0.0000\n".format(endLen))
+            w.write("$indent\t}\n")
         }
+
+        w.write("$indent}\n")
     }
 
     // ─── BVH Motion section ───────────────────────────────────────────────────
@@ -350,19 +366,50 @@ class MotionRecorder(
     private fun quaternionToZXY(q: Quaternion): Triple<Float, Float, Float> {
         val x = q.x; val y = q.y; val z = q.z; val w = q.w
 
-        // ZXY decomposition
-        val sinX = 2f * (w * x + y * z)
-        val cosX = 1f - 2f * (x * x + y * y)
+        // Convert quaternion → rotation matrix elements needed for ZXY decomposition.
+        // R = Rz * Rx * Ry  (intrinsic ZXY ≡ extrinsic YXZ)
+        //
+        // Key matrix elements (row-major):
+        //   R[2][1] =  2(xy + wz)         ← sinX
+        //   R[2][0] =  2(yz - wx)         ← -sinZ * cosX  (used for Z extraction)
+        //   R[2][2] =  1 - 2(x² + y²)     ← cosZ * cosX   (used for Z extraction)
+        //   R[1][1] =  1 - 2(x² + z²)     ← cosX * cosY   (used for Y extraction)
+        //   R[0][1] =  2(xy - wz)         ← sinX * sinY * cosZ + ...  <- not needed
+        //   R[0][0] =  ... not needed
+        //
+        // Standard ZXY extraction:
+        //   sinX        =  2(w*z + x*y)          (R[2][1])
+        //   cosX        =  sqrt(1 - sinX²)        (always non-negative; no quadrant issue for X)
+        //   sinZ/cosX   =  2(w*x - y*z) / cosX   (derived from R[2][0] = -sinZ*cosX)
+        //   cosZ/cosX   =  (1 - 2(x²+y²)) / cosX (derived from R[2][2] = cosZ*cosX)
+        //   sinY/cosX   = -2(w*y - x*z) / cosX   (derived from R[2][?])  <- handled via atan2 below
+        //   cosY/cosX   =  (1 - 2(y²+z²)) / cosX (derived from R[0][0])
+        //
+        // When cosX ≈ 0 (gimbal: X = ±90°) we fall back to setting Y = 0 and solving
+        // for Z from the remaining off-diagonal element — standard gimbal lock handling.
 
-        val sinY_cosX =  2f * (w * y - z * x)
-        val cosY_cosX =  1f - 2f * (x * x + z * z)   // Note: not strictly correct for gimbal
-                                                       // at X = ±90°; clamp handles boundary.
-        val sinZ_cosX =  2f * (w * z + x * y)
-        val cosZ_cosX =  1f - 2f * (y * y + z * z)
+        val sinX = (2f * (w * z + x * y)).coerceIn(-1f, 1f)
+        val ex   = asin(sinX)
+        val cosX = kotlin.math.cos(ex)
 
-        val ex = asin(sinX.coerceIn(-1f, 1f))
-        val ey = atan2(sinY_cosX, cosY_cosX)
-        val ez = atan2(sinZ_cosX, cosZ_cosX)
+        val ey: Float
+        val ez: Float
+
+        if (cosX > 1e-5f) {
+            // Normal case
+            val sinZ = 2f * (w * x - y * z)
+            val cosZ = 1f - 2f * (x * x + y * y)
+            val sinY = -2f * (w * y - x * z)
+            val cosY = 1f - 2f * (y * y + z * z)
+            ez = atan2(sinZ, cosZ)
+            ey = atan2(sinY, cosY)
+        } else {
+            // Gimbal lock: X = ±90°. Set Y = 0, solve Z from off-diagonal.
+            val sinZ = 2f * (w * x + y * z)
+            val cosZ = 1f - 2f * (x * x + z * z)
+            ez = atan2(sinZ, cosZ)
+            ey = 0f
+        }
 
         return Triple(ez * RAD_TO_DEG, ex * RAD_TO_DEG, ey * RAD_TO_DEG)
     }

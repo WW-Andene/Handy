@@ -180,13 +180,13 @@ object AssetLoader {
         val stride   = bv.optInt("byteStride", 12)  // 12 = 3 floats × 4 bytes
 
         val result = FloatArray(count * 3)
-        val bbuf   = ByteBuffer.wrap(bin, bvOffset + byteOff, bin.size - bvOffset - byteOff)
-            .order(ByteOrder.LITTLE_ENDIAN)
+        val base   = bvOffset + byteOff
+        val bbuf   = ByteBuffer.wrap(bin).order(ByteOrder.LITTLE_ENDIAN)
 
         for (i in 0 until count) {
-            result[i * 3]     = bbuf.getFloat(bvOffset + byteOff + i * stride)
-            result[i * 3 + 1] = bbuf.getFloat(bvOffset + byteOff + i * stride + 4)
-            result[i * 3 + 2] = bbuf.getFloat(bvOffset + byteOff + i * stride + 8)
+            result[i * 3]     = bbuf.getFloat(base + i * stride)
+            result[i * 3 + 1] = bbuf.getFloat(base + i * stride + 4)
+            result[i * 3 + 2] = bbuf.getFloat(base + i * stride + 8)
         }
         return result
     }

@@ -8,68 +8,135 @@ import com.arhand.mocap.LoadedAsset
 import com.arhand.mocap.RetargetResult
 import com.arhand.tracking.HandLandmarks
 import com.arhand.util.PerfMonitor
+import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+
+/**
+ * F1 — Atomic RenderCommand replaces 10+ @Volatile fields.
+ *
+ * All per-frame tracking state is packed into a single immutable data class and
+ * published via one AtomicReference.set() call. The GL thread reads it atomically
+ * at the start of onDrawFrame — no partial writes, no inconsistent state mid-frame.
+ */
+data class RenderCommand(
+    val hands:              List<HandLandmarks> = emptyList(),
+    val mirrorX:            Boolean             = true,
+    val renderMode:         RenderMode          = RenderMode.MESH,
+    val torchOn:            Boolean             = true,
+    val showCloud:          Boolean             = false,
+    val retargetResult:     RetargetResult?     = null,
+    val loadedAsset:        LoadedAsset?        = null,
+    val scanCloudPoints:    FloatArray?         = null,
+    val depthMeshPositions: FloatArray?         = null,
+    /** G1 — Live-deformed scanned mesh positions; non-null while live-mesh mode is active. */
+    val liveMeshPositions:  FloatArray?         = null
+)
 
 /**
  * Main OpenGL ES 3.0 renderer.
  * GLSurfaceView.Renderer — runs on the GL thread, separate from tracking and UI threads.
  *
- * Pipeline: onDrawFrame → drawCameraPassthrough → updateHandMeshes → drawScene
- * Camera: Orthographic (matches THREE.OrthographicCamera from HTML prototype)
- * MVP: calculated manually via Matrix.orthoM + aspect ratio
- *
  * [onAspectChanged] is invoked from the GL thread whenever the surface dimensions change.
- * AppViewModel wires this to [AppViewModel.currentAspect] so the scanner coroutine always
- * uses the real device aspect ratio instead of a hardcoded 9/16 constant.
+ * AppViewModel wires this to [AppViewModel.currentAspect].
  */
 class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer {
 
-    // Shared state updated from tracking thread (volatile for visibility)
-    @Volatile var handsData: List<HandLandmarks> = emptyList()
-    @Volatile var renderMode: RenderMode = RenderMode.MESH
-    @Volatile var torchOn: Boolean = true
-    @Volatile var showCloud: Boolean = false
-    @Volatile var mirrorX: Boolean = true
-    @Volatile var scanCloudPoints: FloatArray? = null
-    @Volatile var depthMeshPositions: FloatArray? = null
+    // F1: Single atomic render state — written once per tracking frame, read once per GL frame
+    private val renderCommand = AtomicReference(RenderCommand())
 
-    /** When non-null, [SkinnedMeshRenderer] replaces [HandRenderer] for the primary hand. */
-    @Volatile var loadedAsset: LoadedAsset? = null
+    // Convenience setters so AppViewModel call-sites stay minimal
+
+    var handsData: List<HandLandmarks>
+        get() = renderCommand.get().hands
+        set(v) = renderCommand.updateAndGet { it.copy(hands = v) }.let {}
+
+    var renderMode: RenderMode
+        get() = renderCommand.get().renderMode
+        set(v) = renderCommand.updateAndGet { it.copy(renderMode = v) }.let {}
+
+    var torchOn: Boolean
+        get() = renderCommand.get().torchOn
+        set(v) = renderCommand.updateAndGet { it.copy(torchOn = v) }.let {}
+
+    var showCloud: Boolean
+        get() = renderCommand.get().showCloud
+        set(v) = renderCommand.updateAndGet { it.copy(showCloud = v) }.let {}
+
+    var mirrorX: Boolean
+        get() = renderCommand.get().mirrorX
+        set(v) = renderCommand.updateAndGet { it.copy(mirrorX = v) }.let {}
+
+    var scanCloudPoints: FloatArray?
+        get() = renderCommand.get().scanCloudPoints
+        set(v) = renderCommand.updateAndGet { it.copy(scanCloudPoints = v) }.let {}
+
+    var depthMeshPositions: FloatArray?
+        get() = renderCommand.get().depthMeshPositions
+        set(v) = renderCommand.updateAndGet { it.copy(depthMeshPositions = v) }.let {}
+
+    /** G1 — forward deformed mesh positions for live rendering. */
+    var liveMeshPositions: FloatArray?
+        get() = renderCommand.get().liveMeshPositions
+        set(v) {
+            renderCommand.updateAndGet { it.copy(liveMeshPositions = v) }
+            if (v != null) liveMeshRenderer.updateMesh(v)
+            else liveMeshRenderer.clearMesh()
+        }
+
+    var loadedAsset: LoadedAsset?
+        get() = renderCommand.get().loadedAsset
         set(value) {
-            field = value
+            renderCommand.updateAndGet { it.copy(loadedAsset = value) }
             if (value != null) skinnedMeshRenderer.updateAsset(value)
         }
 
-    /** Latest retarget result — updated by AppViewModel every tracking frame. */
-    @Volatile var latestRetargetResult: RetargetResult? = null
+    var latestRetargetResult: RetargetResult?
+        get() = renderCommand.get().retargetResult
         set(value) {
-            field = value
+            renderCommand.updateAndGet { it.copy(retargetResult = value) }
             if (value != null) skinnedMeshRenderer.updatePose(value)
         }
 
     /**
-     * Callback invoked on the GL thread from [onSurfaceChanged] with the real
-     * surface aspect ratio (width / height).  Set by AppViewModel.
+     * B6 — Last GL texture name allocated for ARCore. Stored so that depth sessions
+     * created after surface initialisation (user enables depth mid-session) can still
+     * receive [setCameraTextureName] immediately on [toggleDepth].
      */
+    var lastArCameraTextureId: Int = 0
+        private set
+
     var onAspectChanged: ((Float) -> Unit)? = null
 
-    private val handRenderers = arrayOf(HandRenderer(), HandRenderer())
-    private val pointCloudRenderer = PointCloudRenderer()
-    private val depthMeshRenderer = DepthMeshRenderer()
-    private val cameraPassthrough = CameraPassthroughRenderer()
-    private val skinnedMeshRenderer = SkinnedMeshRenderer()
+    /**
+     * B6 — Called from the GL thread once a valid EGL context exists.
+     * The Int argument is a newly allocated GL texture name that ARCore's camera
+     * feed can bind to via [ArDepthSession.setCameraTextureName].
+     * AppViewModel wires this to the active [ArDepthSession] in [toggleDepth].
+     */
+    var onGlSurfaceCreated: ((glTextureId: Int) -> Unit)? = null
+
+    /**
+     * B6 — Called from [onDrawFrame] once per frame when ARCore depth mode is active.
+     * Allows the caller to tick [ArDepthSession.update] on the GL thread, which is the
+     * only thread where [com.google.ar.core.Session.update] is safe to call.
+     * Returns the latest [com.arhand.util.Vec3] point cloud (may be empty).
+     */
+    var onDepthFrameTick: (() -> Unit)? = null
+
+    private val handRenderers        = arrayOf(HandRenderer(), HandRenderer())
+    private val pointCloudRenderer   = PointCloudRenderer()
+    private val depthMeshRenderer    = DepthMeshRenderer()
+    private val cameraPassthrough    = CameraPassthroughRenderer()
+    private val skinnedMeshRenderer  = SkinnedMeshRenderer()
+    /** G1 — Renders the live-deforming scanned hand mesh. */
+    private val liveMeshRenderer     = LiveMeshRenderer()
 
     private val projMatrix = FloatArray(16)
     private val viewMatrix = FloatArray(16)
-    private var aspect = 1f
+    private var aspect     = 1f
+    private var timeMs     = 0L
 
-    private var timeMs = 0L
-
-    /**
-     * Called from the tracking coroutine whenever a new camera Bitmap is available.
-     * Thread-safe: just sets a volatile reference; the GL thread reads it in onDrawFrame.
-     */
     fun submitCameraFrame(bitmap: Bitmap) {
         cameraPassthrough.latestBitmap = bitmap
     }
@@ -85,61 +152,72 @@ class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer 
         pointCloudRenderer.init()
         depthMeshRenderer.init()
         skinnedMeshRenderer.init()
+        liveMeshRenderer.init()
 
-        Matrix.setLookAtM(viewMatrix, 0,
-            0f, 0f, 5f,
-            0f, 0f, 0f,
-            0f, 1f, 0f
-        )
+        // B6 — Allocate an OES texture name for ARCore's camera feed and notify the
+        // ViewModel so ArDepthSession.setCameraTextureName() can be called.
+        // This must happen on the GL thread after a valid EGL context exists.
+        val texIds = IntArray(1)
+        GLES30.glGenTextures(1, texIds, 0)
+        lastArCameraTextureId = texIds[0]
+        onGlSurfaceCreated?.invoke(texIds[0])
+
+        Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, 5f, 0f, 0f, 0f, 0f, 1f, 0f)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES30.glViewport(0, 0, width, height)
         aspect = width.toFloat() / height.toFloat()
         Matrix.orthoM(projMatrix, 0, -aspect, aspect, -1f, 1f, -10f, 10f)
-
-        // Publish real aspect to AppViewModel so scanner never uses a hardcoded value
         onAspectChanged?.invoke(aspect)
     }
 
     override fun onDrawFrame(gl: GL10?) {
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
 
-        cameraPassthrough.mirrorX = mirrorX
+        // B6 — Tick the ARCore depth session once per frame on the GL thread.
+        // Session.update() must be called here; it is a no-op when depth mode is off.
+        onDepthFrameTick?.invoke()
+
+        // F1: Snapshot the command once — consistent across the entire frame
+        val cmd = renderCommand.get()
+
+        cameraPassthrough.mirrorX = cmd.mirrorX
         cameraPassthrough.draw()
 
         timeMs = System.currentTimeMillis()
         val timeSec = (timeMs % 100000L) / 1000f
+        val assetLoaded = cmd.loadedAsset != null
 
-        val hands = handsData
-        val assetLoaded = loadedAsset != null
-
-        for (i in hands.indices) {
-            val lms = hands[i]
-            handRenderers[i].update(lms, aspect, mirrorX)
+        for (i in cmd.hands.indices) {
+            val lms = cmd.hands[i]
+            handRenderers[i].update(lms, aspect, cmd.mirrorX)
             if (assetLoaded && i == 0) {
-                // Primary hand: draw procedural hand as ghost at reduced opacity if enabled,
-                // then draw skinned asset on top. Secondary hands always use HandRenderer.
                 if (skinnedMeshRenderer.showGhostOverlay) {
-                    handRenderers[i].draw(viewMatrix, projMatrix, RenderMode.SKELETON, torchOn, timeSec)
+                    handRenderers[i].draw(viewMatrix, projMatrix, RenderMode.SKELETON, cmd.torchOn, timeSec)
                 }
-                skinnedMeshRenderer.draw(viewMatrix, projMatrix, torchOn, timeSec)
+                skinnedMeshRenderer.draw(viewMatrix, projMatrix, cmd.torchOn, timeSec)
             } else {
-                handRenderers[i].draw(viewMatrix, projMatrix, renderMode, torchOn, timeSec)
+                handRenderers[i].draw(viewMatrix, projMatrix, cmd.renderMode, cmd.torchOn, timeSec)
             }
         }
-        for (i in hands.size until handRenderers.size) {
+        for (i in cmd.hands.size until handRenderers.size) {
             handRenderers[i].clear()
         }
 
-        if (showCloud) {
-            scanCloudPoints?.let { pointCloudRenderer.update(it) }
+        if (cmd.showCloud) {
+            cmd.scanCloudPoints?.let { pointCloudRenderer.update(it) }
             pointCloudRenderer.draw(viewMatrix, projMatrix)
         }
 
-        depthMeshPositions?.let {
+        cmd.depthMeshPositions?.let {
             depthMeshRenderer.update(it)
-            depthMeshRenderer.draw(viewMatrix, projMatrix, renderMode)
+            depthMeshRenderer.draw(viewMatrix, projMatrix, cmd.renderMode)
+        }
+
+        // G1 — Draw the live-deforming scanned hand mesh when active
+        if (cmd.liveMeshPositions != null) {
+            liveMeshRenderer.draw(viewMatrix, projMatrix, cmd.torchOn, timeSec)
         }
 
         perfMonitor.onFrame()
@@ -150,8 +228,8 @@ enum class RenderMode {
     MESH,
     WIREFRAME,
     SKELETON,
-    /** Camera passthrough visible; loaded GLB asset rendered on top via live retargeted rotations. */
     ASSET_3D,
-    /** Asset renders as screen-space overlay; IK bone endpoints snap to projected fingertip coords. */
-    ASSET_2D
+    ASSET_2D,
+    /** G1 — Scanned mesh deformed live by the retarget pipeline (the "mirror effect"). */
+    LIVE_MESH
 }
