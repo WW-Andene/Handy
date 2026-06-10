@@ -5,11 +5,15 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+
+    # Opt into Node.js 24 for all actions — avoids the Node.js 20 deprecation
+    # warning and prepares for the forced cutover on June 16th 2026.
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
@@ -21,14 +25,21 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # gradle/actions/setup-gradle@v4 replaces the manual cache + wrapper-jar
-      # bootstrap. It:
-      #   • Caches ~/.gradle/caches and ~/.gradle/wrapper automatically
-      #   • Bootstraps gradle-wrapper.jar if it is missing from the repo
-      #     (fixes: "Unable to access jarfile gradle-wrapper.jar")
-      #   • Runs on Node.js 24 — no Node 20 deprecation warning
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      # gradle-wrapper.jar is not committed to the repo.
+      # The system Gradle (>= 8.11 is guaranteed by setup-gradle) generates it.
+      # Once you commit the jar (`git add gradle/wrapper/gradle-wrapper.jar`),
+      # this step becomes a no-op and can be removed.
+      - name: Generate gradle-wrapper.jar if missing
+        run: |
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "gradle-wrapper.jar not found — generating with system Gradle"
+            gradle wrapper --gradle-version 8.7 --distribution-type bin
+          else
+            echo "gradle-wrapper.jar present — skipping generation"
+          fi
 
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon
