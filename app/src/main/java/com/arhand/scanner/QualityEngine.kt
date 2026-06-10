@@ -13,6 +13,7 @@ import kotlin.math.sqrt
  *   1. Spread score — how far apart the fingers are (normalized)
  *   2. Depth variance — how much Z variation exists (proxy for 3D pose info)
  *   3. Position score — hand is centered and not at extremes
+ *   4. G6 — Temporal consistency score — current frame vs OEF-smoothed history
  *
  * Also evaluates motion completions (fingerCurl, wristRoll, fingerWave, thumbWave).
  */
@@ -25,11 +26,33 @@ object QualityEngine {
         val spreadScore: Float,
         val depthVariance: Float,
         val positionScore: Float,
+        val temporalConsistency: Float,   // G6: 1 = perfectly stable, 0 = temporal outlier
         val passed: Boolean
     )
 
-    fun evaluate(lms: HandLandmarks, claheContrast: Float = 1f): QualityResult {
-        if (lms.size < 21) return QualityResult(0f, 0f, 0f, 0f, false)
+    /**
+     * G6 — Temporal consistency score.
+     * Compares [lms] to [prevLms] (OEF-smoothed history) using mean per-landmark displacement
+     * normalized by palm size. A stable frame scores near 1.0; a jerk frame scores near 0.
+     * Returns 1.0 when [prevLms] is null (first frame has no history to compare against).
+     */
+    fun temporalConsistencyScore(lms: HandLandmarks, prevLms: HandLandmarks?): Float {
+        if (prevLms == null || lms.size != prevLms.size || lms.size < 21) return 1f
+        val palmSize = lmDist(lms[LM.WRIST], lms[LM.MIDDLE_MCP]).coerceAtLeast(0.001f)
+        var totalDisplacement = 0f
+        for (i in lms.indices) {
+            val dx = lms[i].x - prevLms[i].x
+            val dy = lms[i].y - prevLms[i].y
+            val dz = lms[i].z - prevLms[i].z
+            totalDisplacement += sqrt(dx*dx + dy*dy + dz*dz)
+        }
+        val meanDisplacement = totalDisplacement / lms.size
+        // Normalize: displacement of palmSize/4 per frame = fully inconsistent
+        return (1f - (meanDisplacement / (palmSize * 0.25f))).coerceIn(0f, 1f)
+    }
+
+    fun evaluate(lms: HandLandmarks, claheContrast: Float = 1f, prevLms: HandLandmarks? = null): QualityResult {
+        if (lms.size < 21) return QualityResult(0f, 0f, 0f, 0f, 1f, false)
 
         // 1. Spread score: average tip-to-tip distance normalized by palm size
         val palmSize = lmDist(lms[LM.WRIST], lms[LM.MIDDLE_MCP]).coerceAtLeast(0.001f)
@@ -57,17 +80,23 @@ object QualityEngine {
         val distFromCenter = sqrt((cx - 0.5f) * (cx - 0.5f) + (cy - 0.5f) * (cy - 0.5f))
         val positionScore = (1f - distFromCenter * 2.5f).coerceIn(0f, 1f)
 
-        // Composite — weights match HTML prototype
-        val score = (spreadScore * 0.35f +
-                     depthVariance * 0.25f +
-                     positionScore * 0.25f +
-                     (claheContrast.coerceIn(0f, 1f)) * 0.15f)
+        // G6: Temporal consistency — frames that are both high static quality AND
+        // temporally stable are the most valuable for scan accumulation.
+        val temporalScore = temporalConsistencyScore(lms, prevLms)
+
+        // Composite — weights adjusted to include temporal consistency (G6)
+        val score = (spreadScore * 0.30f +
+                     depthVariance * 0.20f +
+                     positionScore * 0.20f +
+                     (claheContrast.coerceIn(0f, 1f)) * 0.15f +
+                     temporalScore * 0.15f)
 
         return QualityResult(
             score = score,
             spreadScore = spreadScore,
             depthVariance = depthVariance,
             positionScore = positionScore,
+            temporalConsistency = temporalScore,
             passed = score >= QUALITY_THRESHOLD
         )
     }

@@ -202,10 +202,10 @@ class SkinnedMeshRenderer {
 
         GLES30.glBindVertexArray(vaoHandle[0])
 
-        uploadFloatVbo(posVbo[0],  pos,     3, loc(skinnedProgram, "aPosition"))
-        uploadFloatVbo(normVbo[0], normals, 3, loc(skinnedProgram, "aNormal"))
-        uploadFloatVboFromInts(skinVbo[0], joints,  4, loc(skinnedProgram, "aJoints"))
-        uploadFloatVbo(wgtVbo[0],  weights, 4, loc(skinnedProgram, "aWeights"))
+        uploadFloatVbo(posVbo[0],  pos,     3, attribLoc(skinnedProgram, "aPosition"))
+        uploadFloatVbo(normVbo[0], normals, 3, attribLoc(skinnedProgram, "aNormal"))
+        uploadFloatVboFromInts(skinVbo[0], joints,  4, attribLoc(skinnedProgram, "aJoints"))
+        uploadFloatVbo(wgtVbo[0],  weights, 4, attribLoc(skinnedProgram, "aWeights"))
 
         GLES30.glBindVertexArray(0)
     }
@@ -248,11 +248,12 @@ class SkinnedMeshRenderer {
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     private fun loc(prog: Int, name: String) = GLES30.glGetUniformLocation(prog, name)
+    private fun attribLoc(prog: Int, name: String) = GLES30.glGetAttribLocation(prog, name)
 
     private fun computeFlatNormals(positions: FloatArray): FloatArray {
         val normals = FloatArray(positions.size)
         var i = 0
-        while (i + 8 < positions.size) {
+        while (i + 9 <= positions.size) {
             val ax = positions[i];   val ay = positions[i+1]; val az = positions[i+2]
             val bx = positions[i+3]; val by = positions[i+4]; val bz = positions[i+5]
             val cx = positions[i+6]; val cy = positions[i+7]; val cz = positions[i+8]

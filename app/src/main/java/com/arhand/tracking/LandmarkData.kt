@@ -2,16 +2,20 @@ package com.arhand.tracking
 
 /**
  * Single hand landmark.
- * @param x       Normalized [0,1] horizontal position
- * @param y       Normalized [0,1] vertical position
- * @param z       Relative depth (MediaPipe proxy, not metric)
- * @param inferred True if this landmark was reconstructed by OcclusionEngine
+ * @param x          Normalized [0,1] horizontal position
+ * @param y          Normalized [0,1] vertical position
+ * @param z          Relative depth (MediaPipe proxy, not metric)
+ * @param inferred   True if this landmark was reconstructed by OcclusionEngine
+ * @param visibility A6: MediaPipe model-confidence score [0,1] for this landmark.
+ *                   0 = model considers the point unreliable; 1 = fully confident.
+ *                   Defaults to 1.0 (fully visible) when not provided.
  */
 data class Landmark(
     val x: Float,
     val y: Float,
     val z: Float,
-    val inferred: Boolean = false
+    val inferred: Boolean = false,
+    val visibility: Float = 1.0f
 )
 
 /** 21-landmark hand, one entry per MediaPipe landmark index */

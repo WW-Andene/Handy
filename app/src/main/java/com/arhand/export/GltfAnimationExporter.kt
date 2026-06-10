@@ -264,6 +264,43 @@ object GltfAnimationExporter {
         })
 
         // Nodes: [mesh node (optional)] + [16 joint nodes]
+        //
+        // glTF skinning spec: each joint node's global transform = product of all ancestor
+        // local transforms up to the skeleton root. Without parent-child "children" links,
+        // every joint's local transform IS its world transform — correct only for world-space
+        // absolute rotations, not the relative shortest-arc rotations produced by BoneRetargeter.
+        // We must wire up the hand skeleton topology:
+        //   Wrist → [ThumbCMC→ThumbMCP→ThumbIP,
+        //            IndexMCP→IndexPIP→IndexDIP,
+        //            MiddleMCP→MiddlePIP→MiddleDIP,
+        //            RingMCP→RingPIP→RingDIP,
+        //            PinkyMCP→PinkyPIP→PinkyDIP]
+        //
+        // jointNodeOffset maps from jointIdx to its node array position.
+        fun jointNodeIdx(j: Int) = jointNodeOffset + JOINT_ORDER.indexOf(j)
+
+        // Build children map: parent jointIdx → list of child jointIdx
+        // Matches BoneRetargeter.BONE_SEGMENTS topology (base → tip means parent → child).
+        val jointChildren = mapOf(
+            BoneRetargeter.JOINT_WRIST      to listOf(
+                BoneRetargeter.JOINT_THUMB_CMC,
+                BoneRetargeter.JOINT_INDEX_MCP,
+                BoneRetargeter.JOINT_MIDDLE_MCP,
+                BoneRetargeter.JOINT_RING_MCP,
+                BoneRetargeter.JOINT_PINKY_MCP
+            ),
+            BoneRetargeter.JOINT_THUMB_CMC  to listOf(BoneRetargeter.JOINT_THUMB_MCP),
+            BoneRetargeter.JOINT_THUMB_MCP  to listOf(BoneRetargeter.JOINT_THUMB_IP),
+            BoneRetargeter.JOINT_INDEX_MCP  to listOf(BoneRetargeter.JOINT_INDEX_PIP),
+            BoneRetargeter.JOINT_INDEX_PIP  to listOf(BoneRetargeter.JOINT_INDEX_DIP),
+            BoneRetargeter.JOINT_MIDDLE_MCP to listOf(BoneRetargeter.JOINT_MIDDLE_PIP),
+            BoneRetargeter.JOINT_MIDDLE_PIP to listOf(BoneRetargeter.JOINT_MIDDLE_DIP),
+            BoneRetargeter.JOINT_RING_MCP   to listOf(BoneRetargeter.JOINT_RING_PIP),
+            BoneRetargeter.JOINT_RING_PIP   to listOf(BoneRetargeter.JOINT_RING_DIP),
+            BoneRetargeter.JOINT_PINKY_MCP  to listOf(BoneRetargeter.JOINT_PINKY_PIP),
+            BoneRetargeter.JOINT_PINKY_PIP  to listOf(BoneRetargeter.JOINT_PINKY_DIP)
+        )
+
         val nodesArr = JSONArray()
 
         if (asset.meshPositions.isNotEmpty()) {
@@ -276,10 +313,17 @@ object GltfAnimationExporter {
             nodesArr.put(meshNode)
         }
 
-        // Joint nodes (no geometry — driven by animation)
+        // Joint nodes — include "children" arrays for proper hierarchy composition
         for (jointIdx in JOINT_ORDER) {
-            val name = JOINT_NODE_NAMES[jointIdx] ?: "Joint$jointIdx"
-            nodesArr.put(JSONObject().put("name", name))
+            val name     = JOINT_NODE_NAMES[jointIdx] ?: "Joint$jointIdx"
+            val children = jointChildren[jointIdx]
+            val node     = JSONObject().put("name", name)
+            if (!children.isNullOrEmpty()) {
+                val childArr = JSONArray()
+                children.forEach { childArr.put(jointNodeIdx(it)) }
+                node.put("children", childArr)
+            }
+            nodesArr.put(node)
         }
 
         root.put("nodes", nodesArr)

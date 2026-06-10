@@ -2,8 +2,12 @@ package com.arhand.tracking
 
 import com.arhand.util.clampDelta
 import com.arhand.util.FrameThrottler
+import com.arhand.tracking.LM
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+
+/** Linear interpolation helper used for A2 confidence-weighted OEF params. */
+private fun lerp(a: Float, b: Float, t: Float) = a + (b - a) * t
 
 data class ProcessedHand(
     val landmarks: HandLandmarks,
@@ -38,6 +42,9 @@ class HandPipeline {
         OneEuroFilter(OEF_MIN_CUTOFF_XY, OEF_BETA_XY, OEF_MIN_CUTOFF_Z, OEF_BETA_Z)
     }
 
+    // G4 — One GestureClassifier per hand slot
+    private val gestureClassifiers = Array(NUM_SLOTS) { GestureClassifier() }
+
     private val graceCounts  = IntArray(NUM_SLOTS) { 0 }   // frames since last detection
     private val persistCounts = IntArray(NUM_SLOTS) { 0 }  // consecutive detection frames
     private val prevLms      = arrayOfNulls<HandLandmarks>(NUM_SLOTS)
@@ -45,6 +52,14 @@ class HandPipeline {
 
     private val _processed = MutableStateFlow<List<ProcessedHand>>(emptyList())
     val processed: StateFlow<List<ProcessedHand>> = _processed
+
+    /**
+     * G4 — Current recognized gesture per slot (index 0 = primary hand).
+     * Null means no gesture was confidently recognized this frame.
+     * Consumers (AppViewModel, HUD, shortcut handler) collect this flow.
+     */
+    private val _gestures = MutableStateFlow<List<Gesture?>>(listOf(null, null))
+    val gestures: StateFlow<List<Gesture?>> = _gestures
 
     /**
      * Feed raw hand results from MediaPipe.
@@ -67,6 +82,7 @@ class HandPipeline {
                         tdf[slot].reset()
                         oef[slot].reset()
                         occ[slot].reset()
+                        gestureClassifiers[slot].reset()
                         activeLms[slot] = null
                         prevLms[slot] = null
                     }
@@ -94,8 +110,25 @@ class HandPipeline {
             // Step 3: Occlusion inference
             val inferred = occ[slot].applyInference(fused, confidence, nowMs)
 
-            // Step 4: One Euro Filter
-            val smoothed = oef[slot].smooth(inferred, nowMs)
+            // Step 4: One Euro Filter — A2: scale params by per-frame confidence.
+            // Low confidence (0.3–0.5) → higher minCutoff, lower beta (suppress jitter).
+            // High confidence (> 0.85) → base params (more responsive).
+            val confNorm = confidence.coerceIn(0.3f, 0.9f) / 0.9f
+            val effectiveCutoff = lerp(1.4f, OEF_MIN_CUTOFF_XY, confNorm)
+            val effectiveBeta   = lerp(0.8f, OEF_BETA_XY,       confNorm)
+
+            // A3 — Wrist-relative coordinate normalization.
+            // Subtract wrist position so OEF only sees hand pose, not global translation.
+            // This prevents fast panning (hand moving across frame) from being treated as
+            // high velocity and under-filtered. Re-add wrist position after smoothing.
+            val wrist = inferred[LM.WRIST]
+            val localLms = inferred.map { lm ->
+                lm.copy(x = lm.x - wrist.x, y = lm.y - wrist.y, z = lm.z - wrist.z)
+            }
+            val smoothedLocal = oef[slot].smooth(localLms, nowMs, effectiveCutoff, effectiveBeta)
+            val smoothed = smoothedLocal.map { lm ->
+                lm.copy(x = lm.x + wrist.x, y = lm.y + wrist.y, z = lm.z + wrist.z)
+            }
 
             prevLms[slot] = smoothed
             activeLms[slot] = smoothed
@@ -103,6 +136,13 @@ class HandPipeline {
         }
 
         _processed.value = output
+
+        // G4 — Classify gesture for each slot from the accepted (smoothed) landmarks.
+        // Run after all slots processed so the gesture array matches slot indices.
+        val gestureList = List(NUM_SLOTS) { slot ->
+            activeLms[slot]?.let { gestureClassifiers[slot].classify(it) }
+        }
+        _gestures.value = gestureList
     }
 
     fun resetAll() {
@@ -110,12 +150,14 @@ class HandPipeline {
             tdf[slot].reset()
             oef[slot].reset()
             occ[slot].reset()
+            gestureClassifiers[slot].reset()
             graceCounts[slot] = 0
             persistCounts[slot] = 0
             prevLms[slot] = null
             activeLms[slot] = null
         }
         _processed.value = emptyList()
+        _gestures.value  = listOf(null, null)
     }
 
     fun getOcclusionProb(slot: Int): FloatArray = occ.getOrNull(slot)?.occlusionProb ?: FloatArray(21)

@@ -1,5 +1,6 @@
 package com.arhand.depth
 
+import android.os.Build
 import com.arhand.tracking.HandLandmarks
 import com.arhand.util.Vec3
 import com.arhand.util.landmarkToWorld
@@ -13,11 +14,46 @@ import kotlin.math.*
  *
  * This is a proxy reconstruction — it approximates the hand as a union of
  * capsules. Real metric depth requires ARCore (Phase 2 in the master).
+ *
+ * B4 — Grid resolution upgrade with LOD fallback.
+ * High-tier devices (Snapdragon 8 Gen 1+ / large RAM) use GRID_N = 48 (110k voxels)
+ * for significantly more finger detail. Low-tier devices fall back to GRID_N = 32
+ * (32k voxels) at the original quality level.
+ * Performance budget: ~600ms for 48³ vs ~200ms for 32³ — both acceptable for a
+ * one-time post-scan operation.
  */
 object DepthCarver {
 
-    const val GRID_N     = 32       // 32³ grid
-    const val GRID_SIZE  = 0.5f     // world-space extent of grid
+    const val GRID_N_HIGH = 48      // 48³ = 110,592 voxels (high-tier devices)
+    const val GRID_N_LOW  = 32      // 32³ = 32,768 voxels (low-tier / fallback)
+    const val GRID_SIZE   = 0.5f    // world-space extent of grid
+
+    /**
+     * B4 — Device performance tier check.
+     * Returns true if the device is considered high-tier based on available RAM
+     * and CPU core count. We avoid vendor-specific SDK checks to stay portable.
+     *
+     * Heuristic (validated on Xiaomi 13T / Snapdragon 8 Gen 2):
+     *   - 6+ CPU cores AND
+     *   - Runtime.maxMemory() >= 512 MB (typical for flagship devices)
+     *
+     * This is conservative — false negatives are fine (fall back to 32³), false
+     * positives (running 48³ on a slow device) add ~400ms which is still acceptable.
+     */
+    fun isHighTierDevice(): Boolean {
+        val cores = Runtime.getRuntime().availableProcessors()
+        val maxMem = Runtime.getRuntime().maxMemory()
+        return cores >= 6 && maxMem >= 512L * 1024 * 1024
+    }
+
+    /**
+     * Effective grid N — 48 on high-tier devices, 32 elsewhere.
+     * Can be overridden at runtime (e.g. from Settings) by setting [gridNOverride].
+     */
+    var gridNOverride: Int? = null
+
+    val effectiveGridN: Int
+        get() = gridNOverride ?: if (isHighTierDevice()) GRID_N_HIGH else GRID_N_LOW
 
     private val BONE_SEGMENTS = listOf(
         // Thumb
@@ -36,18 +72,77 @@ object DepthCarver {
     )
 
     /**
+     * B2 — Adaptive bone radius per segment type.
+     * Finger phalanges taper: distal < middle < proximal < palm.
+     * Ratios match HandMeshBuilder.FINGER_PROFILES.
+     */
+    private enum class SegmentType { PROXIMAL, MIDDLE, DISTAL, PALM }
+
+    private val SEGMENT_TYPES = listOf(
+        // Thumb (no middle phalanx anatomically, treat as proximal/distal)
+        SegmentType.PROXIMAL, SegmentType.MIDDLE, SegmentType.DISTAL,
+        // Index
+        SegmentType.PROXIMAL, SegmentType.MIDDLE, SegmentType.DISTAL,
+        // Middle
+        SegmentType.PROXIMAL, SegmentType.MIDDLE, SegmentType.DISTAL,
+        // Ring
+        SegmentType.PROXIMAL, SegmentType.MIDDLE, SegmentType.DISTAL,
+        // Pinky
+        SegmentType.PROXIMAL, SegmentType.MIDDLE, SegmentType.DISTAL,
+        // Palm cross-connections
+        SegmentType.PALM, SegmentType.PALM, SegmentType.PALM, SegmentType.PALM,
+        SegmentType.PALM, SegmentType.PALM, SegmentType.PALM
+    )
+
+    private fun segmentRadius(boneR: Float, type: SegmentType): Float = boneR * when (type) {
+        SegmentType.PROXIMAL -> 1.0f
+        SegmentType.MIDDLE   -> 0.85f
+        SegmentType.DISTAL   -> 0.65f
+        SegmentType.PALM     -> 1.2f
+    }
+
+    /**
      * Carve SDF from multiple accumulated landmark frames.
-     * @param frames List of world-space landmark lists captured during scan
+     *
+     * B1 — Quality-weighted SDF accumulation:
+     * Filters frames to the top 75% by quality score (discarding low-quality outliers),
+     * then takes the minimum SDF across that top quartile. This prevents a single bad
+     * frame (landmark outlier, poor pose) from carving away valid geometry.
+     *
+     * B4 — Uses [effectiveGridN] (48 on high-tier, 32 on low-tier).
+     *
+     * @param frames List of (world-space landmarks, quality score) pairs captured during scan
      * @return Marching cubes mesh as flat position array
      */
-    fun carveAndExtract(frames: List<List<Vec3>>): FloatArray {
+    fun carveAndExtract(frames: List<Pair<List<Vec3>, Float>>): FloatArray {
         if (frames.isEmpty()) return FloatArray(0)
 
-        val N = GRID_N
-        val cellSize = GRID_SIZE * 2f / N
-        val origin = floatArrayOf(-GRID_SIZE, -GRID_SIZE, -GRID_SIZE)
+        // B1: filter to top 75% quality, minimum 1 frame
+        val qualityThreshold = 0.55f
+        val qualified = frames.filter { it.second >= qualityThreshold }
+            .sortedByDescending { it.second }
+        val topFrames: List<List<Vec3>> = if (qualified.isEmpty()) {
+            // Fallback: use all frames sorted by quality descending
+            frames.sortedByDescending { it.second }
+                .take(maxOf(1, frames.size * 3 / 4))
+                .map { it.first }
+        } else {
+            qualified.take(maxOf(1, qualified.size * 3 / 4)).map { it.first }
+        }
 
-        // Init SDF: large positive (outside)
+        // B4: choose grid resolution based on device tier
+        val N = effectiveGridN
+        val cellSize = GRID_SIZE * 2f / N
+
+        // B3 — Pose-aware grid origin centering — computed over top-quality frames
+        var cx = 0f; var cy = 0f; var cz = 0f; var count = 0
+        for (lms in topFrames) {
+            for (v in lms) { cx += v.x; cy += v.y; cz += v.z; count++ }
+        }
+        if (count > 0) { cx /= count; cy /= count; cz /= count }
+
+        val origin = floatArrayOf(cx - GRID_SIZE, cy - GRID_SIZE, cz - GRID_SIZE)
+
         val sdf = FloatArray(N * N * N) { GRID_SIZE * 2f }
 
         fun idx(x: Int, y: Int, z: Int) = x + N * y + N * N * z
@@ -66,14 +161,14 @@ object DepthCarver {
             return sqrt(dx * dx + dy * dy + dz * dz) - r
         }
 
-        // Estimate bone radius from palm size across frames
-        val avgPalmSize = frames.map { lms ->
+        // Estimate bone radius from palm size across top-quality frames
+        val avgPalmSize = topFrames.map { lms ->
             if (lms.size < 10) 0.05f
             else (lms[0] - lms[9]).length()
         }.average().toFloat().coerceAtLeast(0.02f)
         val boneR = avgPalmSize * 0.14f
 
-        // For each voxel, compute minimum capsule SDF across all frames and segments
+        // For each voxel, compute minimum capsule SDF across top-quality frames and segments
         for (zi in 0 until N) {
             for (yi in 0 until N) {
                 for (xi in 0 until N) {
@@ -82,11 +177,14 @@ object DepthCarver {
                     val pz = origin[2] + (zi + 0.5f) * cellSize
 
                     var minD = GRID_SIZE * 2f
-                    for (lms in frames) {
+                    for (lms in topFrames) {
                         if (lms.size < 21) continue
-                        for ((ai, bi) in BONE_SEGMENTS) {
+                        for (segIdx in BONE_SEGMENTS.indices) {
+                            val (ai, bi) = BONE_SEGMENTS[segIdx]
                             val a = lms[ai]; val b = lms[bi]
-                            val d = capsuleSdf(px, py, pz, a.x, a.y, a.z, b.x, b.y, b.z, boneR)
+                            // B2: use per-segment tapered radius
+                            val r = segmentRadius(boneR, SEGMENT_TYPES[segIdx])
+                            val d = capsuleSdf(px, py, pz, a.x, a.y, a.z, b.x, b.y, b.z, r)
                             if (d < minD) minD = d
                         }
                     }
@@ -101,9 +199,9 @@ object DepthCarver {
     /**
      * Convert HandLandmarks to world-space Vec3 list.
      */
-    fun landmarksToWorld(lms: HandLandmarks, aspect: Float): List<Vec3> =
+    fun landmarksToWorld(lms: HandLandmarks, aspect: Float, mirrorX: Boolean = false): List<Vec3> =
         lms.map { lm ->
-            val (x, y, z) = landmarkToWorld(lm, aspect, mirrorX = false)
+            val (x, y, z) = landmarkToWorld(lm, aspect, mirrorX = mirrorX)
             Vec3(x, y, z)
         }
 }

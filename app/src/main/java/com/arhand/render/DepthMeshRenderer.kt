@@ -18,6 +18,7 @@ class DepthMeshRenderer {
 
     // Persistent VBO — single buffer, reused every frame
     private val vboHandle = IntArray(1)
+    private val normVboHandle = IntArray(1)
     private var vboCapacityFloats = 0   // current allocated capacity (in floats)
 
     private var meshPositions: FloatArray = FloatArray(0)
@@ -29,6 +30,7 @@ class DepthMeshRenderer {
         lineProgram  = buildProg(ShaderPrograms.LINE_VERT,  ShaderPrograms.LINE_FRAG)
 
         GLES30.glGenBuffers(1, vboHandle, 0)
+        GLES30.glGenBuffers(1, normVboHandle, 0)
     }
 
     fun update(positions: FloatArray) {
@@ -61,18 +63,22 @@ class DepthMeshRenderer {
             GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(phongProgram, "uModel"), 1, false, model, 0)
             GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(phongProgram, "uView"),  1, false, view,  0)
             GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(phongProgram, "uProjection"), 1, false, proj, 0)
+            // Identity model → normal matrix is also identity
+            val identNorm = floatArrayOf(1f,0f,0f, 0f,1f,0f, 0f,0f,1f)
+            GLES30.glUniformMatrix3fv(GLES30.glGetUniformLocation(phongProgram, "uNormalMatrix"), 1, false, identNorm, 0)
             GLES30.glUniform3fv(GLES30.glGetUniformLocation(phongProgram, "uBaseColor"), 1, floatArrayOf(0.5f, 0.8f, 1.0f), 0)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(phongProgram, "uAlpha"), 0.4f)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(phongProgram, "uTorchOn"), 0)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(phongProgram, "uInferred"), 0)
+            GLES30.glUniform3fv(GLES30.glGetUniformLocation(phongProgram, "uCameraPos"), 1, floatArrayOf(0f, 0f, 5f), 0)
             GLES30.glDepthMask(false)
-            drawBound(phongProgram, meshPositions.size, GLES30.GL_TRIANGLES)
+            drawBoundPhong(meshPositions.size)
             GLES30.glDepthMask(true)
         }
     }
 
     /**
-     * Upload vertex data into the persistent VBO.
+     * Upload vertex data into the persistent VBOs.
      * Uses glBufferData only when the buffer needs to grow; otherwise glBufferSubData.
      */
     private fun uploadGeometry(verts: FloatArray) {
@@ -91,6 +97,18 @@ class DepthMeshRenderer {
             GLES30.glBufferSubData(GLES30.GL_ARRAY_BUFFER, 0, verts.size * 4, buf)
         }
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+
+        // Upload normals into the dedicated normals VBO
+        val norms = meshNormals
+        if (norms.isNotEmpty()) {
+            val normBuf = ByteBuffer.allocateDirect(norms.size * 4)
+                .order(ByteOrder.nativeOrder())
+                .asFloatBuffer()
+                .apply { put(norms); position(0) }
+            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, normVboHandle[0])
+            GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, norms.size * 4, normBuf, GLES30.GL_DYNAMIC_DRAW)
+            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+        }
     }
 
     /** Draw using the already-bound persistent VBO — no alloc, no delete. */
@@ -104,12 +122,37 @@ class DepthMeshRenderer {
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
     }
 
+    /** Draw Phong pass: binds positions VBO + normals VBO. */
+    private fun drawBoundPhong(vertFloats: Int) {
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vboHandle[0])
+        val posLoc = GLES30.glGetAttribLocation(phongProgram, "aPosition")
+        GLES30.glEnableVertexAttribArray(posLoc)
+        GLES30.glVertexAttribPointer(posLoc, 3, GLES30.GL_FLOAT, false, 0, 0)
+
+        val normLoc = GLES30.glGetAttribLocation(phongProgram, "aNormal")
+        if (normLoc >= 0 && meshNormals.isNotEmpty()) {
+            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, normVboHandle[0])
+            GLES30.glEnableVertexAttribArray(normLoc)
+            GLES30.glVertexAttribPointer(normLoc, 3, GLES30.GL_FLOAT, false, 0, 0)
+        }
+
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, vertFloats / 3)
+
+        GLES30.glDisableVertexAttribArray(posLoc)
+        if (normLoc >= 0) GLES30.glDisableVertexAttribArray(normLoc)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+    }
+
     /** Release GPU resources. Call from the GL thread when the surface is destroyed. */
     fun release() {
         if (vboHandle[0] != 0) {
             GLES30.glDeleteBuffers(1, vboHandle, 0)
             vboHandle[0] = 0
             vboCapacityFloats = 0
+        }
+        if (normVboHandle[0] != 0) {
+            GLES30.glDeleteBuffers(1, normVboHandle, 0)
+            normVboHandle[0] = 0
         }
         if (phongProgram != 0) { GLES30.glDeleteProgram(phongProgram); phongProgram = 0 }
         if (lineProgram  != 0) { GLES30.glDeleteProgram(lineProgram);  lineProgram  = 0 }
@@ -118,7 +161,7 @@ class DepthMeshRenderer {
     private fun computeFlatNormals(positions: FloatArray): FloatArray {
         val normals = FloatArray(positions.size)
         var i = 0
-        while (i + 8 < positions.size) {
+        while (i + 9 <= positions.size) {
             val ax = positions[i];   val ay = positions[i+1]; val az = positions[i+2]
             val bx = positions[i+3]; val by = positions[i+4]; val bz = positions[i+5]
             val cx = positions[i+6]; val cy = positions[i+7]; val cz = positions[i+8]
