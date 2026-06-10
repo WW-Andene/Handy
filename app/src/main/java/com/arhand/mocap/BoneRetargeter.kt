@@ -153,9 +153,19 @@ class BoneRetargeter(private val bindPose: BindPose) {
 
         rotations[JOINT_WRIST] = wristRot
 
+        // Build world-space joint positions from the landmark positions.
+        // LiveMeshDeformer needs these to set the translation component of each bone matrix;
+        // without them every non-wrist joint pivots around the world origin.
+        val positions = HashMap<Int, Vec3>(JOINT_COUNT)
+        positions[JOINT_WRIST] = wristPos
+        for ((jointIdx, _, tipIdx) in BONE_SEGMENTS) {
+            positions[jointIdx] = world[tipIdx]
+        }
+
         return RetargetResult(
             jointRotations = rotations,
-            wristTransform = WristTransform(position = wristPos, rotation = wristRot)
+            wristTransform = WristTransform(position = wristPos, rotation = wristRot),
+            jointPositions = positions
         )
     }
 
@@ -210,7 +220,13 @@ data class RetargetResult(
     /** Joint index → quaternion rotation. Apply to asset joint nodes each frame. */
     val jointRotations: Map<Int, Quaternion>,
     /** Wrist root position + rotation in world space. */
-    val wristTransform: WristTransform
+    val wristTransform: WristTransform,
+    /**
+     * World-space position of each joint in the current frame, keyed by JOINT_* constants.
+     * Required by [com.arhand.render.LiveMeshDeformer] to build correct LBS bone matrices —
+     * without per-joint translation, non-wrist joints all pivot around the world origin.
+     */
+    val jointPositions: Map<Int, Vec3> = emptyMap()
 )
 
 data class WristTransform(

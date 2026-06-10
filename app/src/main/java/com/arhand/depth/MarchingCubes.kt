@@ -601,7 +601,13 @@ object MarchingCubes {
 
                     // Interpolate edge vertices
                     fun interp(i: Int, j: Int): FloatArray {
-                        val t = (-vals[i] / (vals[j] - vals[i])).coerceIn(0f, 1f)
+                        val denom = vals[j] - vals[i]
+                        // Guard against zero denominator (both corners on the iso-surface).
+                        // Without this check, -vals[i]/0f = ±Infinity or NaN, which
+                        // survives coerceIn on the JVM and propagates into vertex data,
+                        // producing degenerate triangles through MeshSmoother and GLBExporter.
+                        val t = if (kotlin.math.abs(denom) < 1e-7f) 0.5f
+                                else (-vals[i] / denom).coerceIn(0f, 1f)
                         return floatArrayOf(
                             corners[i][0] + t * (corners[j][0] - corners[i][0]),
                             corners[i][1] + t * (corners[j][1] - corners[i][1]),

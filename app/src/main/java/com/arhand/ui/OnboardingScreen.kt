@@ -1,9 +1,8 @@
-@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
-
 package com.arhand.ui
 
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -75,6 +74,7 @@ private val PAGES = listOf(
  *
  * @param onDismiss Called when the user finishes or skips the onboarding.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun OnboardingScreen(onDismiss: () -> Unit) {
     val pagerState = rememberPagerState(pageCount = { PAGES.size })

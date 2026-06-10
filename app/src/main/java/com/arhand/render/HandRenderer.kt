@@ -33,6 +33,40 @@ class HandRenderer {
     private val meshVbo = IntArray(2)  // [0]=positions, [1]=normals
     private val meshIbo = IntArray(1)
 
+    // Cached uniform/attrib locations — populated once in init() after shader compilation.
+    // glGetUniformLocation/glGetAttribLocation are synchronous driver string-hash calls.
+    // Calling them every frame (previously ~150 calls/frame/hand at 30fps) produced
+    // measurable CPU stalls. Caching reduces this to zero per-frame overhead.
+    private val phongLoc  = HashMap<String, Int>(32)
+    private val basicLoc  = HashMap<String, Int>(8)
+    private val lineLoc   = HashMap<String, Int>(8)
+
+    private fun cacheLocations() {
+        // Phong program uniforms + attribs
+        for (name in listOf(
+            "uModel", "uView", "uProjection", "uNormalMatrix",
+            "uCameraPos", "uTime", "uAlpha", "uBaseColor", "uInferred",
+            "uAmbientColor", "uAmbientIntensity",
+            "uKeyDir", "uKeyColor", "uKeyIntensity",
+            "uRimDir", "uRimColor", "uRimIntensity",
+            "uSSSDir", "uSSSColor", "uSSSIntensity",
+            "uFillDir", "uFillColor", "uFillIntensity",
+            "uTorchPos", "uTorchColor", "uTorchIntensity", "uTorchAttenuation", "uTorchOn"
+        )) phongLoc[name] = GLES30.glGetUniformLocation(phongProgram, name)
+        phongLoc["aPosition"] = GLES30.glGetAttribLocation(phongProgram, "aPosition")
+        phongLoc["aNormal"]   = GLES30.glGetAttribLocation(phongProgram, "aNormal")
+
+        // Basic program
+        for (name in listOf("uModel", "uView", "uProjection", "uColor"))
+            basicLoc[name] = GLES30.glGetUniformLocation(basicProgram, name)
+        basicLoc["aPosition"] = GLES30.glGetAttribLocation(basicProgram, "aPosition")
+
+        // Line program
+        for (name in listOf("uModel", "uView", "uProjection", "uColor"))
+            lineLoc[name] = GLES30.glGetUniformLocation(lineProgram, name)
+        lineLoc["aPosition"] = GLES30.glGetAttribLocation(lineProgram, "aPosition")
+    }
+
     fun init() {
         phongProgram = compileProgram(ShaderPrograms.PHONG_VERT, ShaderPrograms.PHONG_FRAG)
         basicProgram = compileProgram(ShaderPrograms.BASIC_VERT, ShaderPrograms.BASIC_FRAG)
@@ -41,6 +75,8 @@ class HandRenderer {
         GLES30.glGenVertexArrays(1, meshVao, 0)
         GLES30.glGenBuffers(2, meshVbo, 0)
         GLES30.glGenBuffers(1, meshIbo, 0)
+
+        cacheLocations()
     }
 
     private var currentLms: HandLandmarks? = null
@@ -93,9 +129,9 @@ class HandRenderer {
         )
         setLightingUniforms(phongProgram, torchOn, timeSec, pts)
 
-        GLES30.glUniform3fv(GLES30.glGetUniformLocation(phongProgram, "uBaseColor"), 1, skinColor, 0)
-        GLES30.glUniform1f(GLES30.glGetUniformLocation(phongProgram, "uAlpha"), 0.97f)
-        GLES30.glUniform1f(GLES30.glGetUniformLocation(phongProgram, "uTime"), timeSec)
+        GLES30.glUniform3fv(phongLoc["uBaseColor"]!!, 1, skinColor, 0)
+        GLES30.glUniform1f(phongLoc["uAlpha"]!!, 0.97f)
+        GLES30.glUniform1f(phongLoc["uTime"]!!, timeSec)
 
         // Draw each finger tube
         val unitR = computeUnitR(pts)
@@ -108,13 +144,13 @@ class HandRenderer {
 
             val mesh = HandMeshBuilder.buildTube(fingerPts, bulged.toList())
             val hasInferred = chain.any { lms[it].inferred }
-            GLES30.glUniform1i(GLES30.glGetUniformLocation(phongProgram, "uInferred"), if (hasInferred) 1 else 0)
+            GLES30.glUniform1i(phongLoc["uInferred"]!!, if (hasInferred) 1 else 0)
             drawMeshData(phongProgram, mesh)
         }
 
         // Palm
         val palmMesh = HandMeshBuilder.buildPalmGeo(pts, unitR)
-        GLES30.glUniform1i(GLES30.glGetUniformLocation(phongProgram, "uInferred"), 0)
+        GLES30.glUniform1i(phongLoc["uInferred"]!!, 0)
         drawMeshData(phongProgram, palmMesh)
 
         // Webbings
@@ -128,7 +164,7 @@ class HandRenderer {
         // Nails
         GLES30.glUseProgram(basicProgram)
         val nailColor = floatArrayOf(0.9f, 0.82f, 0.78f, 0.85f)
-        GLES30.glUniform4fv(GLES30.glGetUniformLocation(basicProgram, "uColor"), 1, nailColor, 0)
+        GLES30.glUniform4fv(basicLoc["uColor"]!!, 1, nailColor, 0)
         setMatrixUniforms(basicProgram, model, view, proj)
         for (fi in HandMeshBuilder.FINGER_CHAINS.indices) {
             val chain = HandMeshBuilder.FINGER_CHAINS[fi]
@@ -148,7 +184,7 @@ class HandRenderer {
         val model = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
         setMatrixUniforms(lineProgram, model, view, proj)
         val wireColor = floatArrayOf(0f, 1f, 0.898f, 0.7f) // plasma
-        GLES30.glUniform4fv(GLES30.glGetUniformLocation(lineProgram, "uColor"), 1, wireColor, 0)
+        GLES30.glUniform4fv(lineLoc["uColor"]!!, 1, wireColor, 0)
 
         for (fi in HandMeshBuilder.FINGER_CHAINS.indices) {
             val chain = HandMeshBuilder.FINGER_CHAINS[fi]
@@ -162,7 +198,7 @@ class HandRenderer {
         val model = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
         setMatrixUniforms(lineProgram, model, view, proj)
         val skelColor = floatArrayOf(0f, 1f, 0.898f, 0.9f)
-        GLES30.glUniform4fv(GLES30.glGetUniformLocation(lineProgram, "uColor"), 1, skelColor, 0)
+        GLES30.glUniform4fv(lineLoc["uColor"]!!, 1, skelColor, 0)
 
         val lineVerts = mutableListOf<Float>()
         val connections = listOf(
@@ -192,19 +228,20 @@ class HandRenderer {
     }
 
     private fun setMatrixUniforms(prog: Int, model: FloatArray, view: FloatArray, proj: FloatArray) {
-        GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(prog, "uModel"),      1, false, model, 0)
-        GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(prog, "uView"),       1, false, view,  0)
-        GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(prog, "uProjection"), 1, false, proj,  0)
+        val locs = if (prog == phongProgram) phongLoc else if (prog == basicProgram) basicLoc else lineLoc
+        GLES30.glUniformMatrix4fv(locs["uModel"]!!,      1, false, model, 0)
+        GLES30.glUniformMatrix4fv(locs["uView"]!!,       1, false, view,  0)
+        GLES30.glUniformMatrix4fv(locs["uProjection"]!!, 1, false, proj,  0)
     }
 
     private fun setLightingUniforms(prog: Int, torchOn: Boolean, timeSec: Float, pts: List<Vec3>) {
         val L = LightingModel
         fun setV3(name: String, v: FloatArray) =
-            GLES30.glUniform3fv(GLES30.glGetUniformLocation(prog, name), 1, v, 0)
+            GLES30.glUniform3fv(phongLoc[name]!!, 1, v, 0)
         fun setF(name: String, v: Float) =
-            GLES30.glUniform1f(GLES30.glGetUniformLocation(prog, name), v)
+            GLES30.glUniform1f(phongLoc[name]!!, v)
         fun setI(name: String, v: Int) =
-            GLES30.glUniform1i(GLES30.glGetUniformLocation(prog, name), v)
+            GLES30.glUniform1i(phongLoc[name]!!, v)
 
         setV3("uAmbientColor",    L.ambientColor);   setF("uAmbientIntensity", L.ambientIntensity)
         setV3("uKeyDir",          L.keyDir);          setV3("uKeyColor", L.keyColor);   setF("uKeyIntensity",  L.keyIntensity)
@@ -218,7 +255,7 @@ class HandRenderer {
         }
         setV3("uTorchColor", L.torchColor)
         setF("uTorchIntensity", L.torchIntensity)
-        GLES30.glUniform3fv(GLES30.glGetUniformLocation(prog, "uTorchAttenuation"), 1, L.torchAttenuation, 0)
+        GLES30.glUniform3fv(phongLoc["uTorchAttenuation"]!!, 1, L.torchAttenuation, 0)
         setI("uTorchOn", if (torchOn) 1 else 0)
 
         setV3("uCameraPos", floatArrayOf(0f, 0f, 5f))
@@ -228,22 +265,26 @@ class HandRenderer {
     private fun drawMeshData(prog: Int, mesh: HandMeshBuilder.MeshData) {
         if (mesh.positions.isEmpty()) return
 
+        val locs = if (prog == phongProgram) phongLoc else basicLoc
+
         GLES30.glBindVertexArray(meshVao[0])
 
         // Positions
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, meshVbo[0])
         val posBuf = toFloatBuffer(mesh.positions)
         GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, mesh.positions.size * 4, posBuf, GLES30.GL_DYNAMIC_DRAW)
-        val posLoc = GLES30.glGetAttribLocation(prog, "aPosition")
-        GLES30.glEnableVertexAttribArray(posLoc)
-        GLES30.glVertexAttribPointer(posLoc, 3, GLES30.GL_FLOAT, false, 0, 0)
+        val posLoc = locs["aPosition"] ?: -1
+        if (posLoc >= 0) {
+            GLES30.glEnableVertexAttribArray(posLoc)
+            GLES30.glVertexAttribPointer(posLoc, 3, GLES30.GL_FLOAT, false, 0, 0)
+        }
 
         // Normals
         if (mesh.normals.isNotEmpty()) {
             GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, meshVbo[1])
             val normBuf = toFloatBuffer(mesh.normals)
             GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, mesh.normals.size * 4, normBuf, GLES30.GL_DYNAMIC_DRAW)
-            val normLoc = GLES30.glGetAttribLocation(prog, "aNormal")
+            val normLoc = locs["aNormal"] ?: -1
             if (normLoc >= 0) {
                 GLES30.glEnableVertexAttribArray(normLoc)
                 GLES30.glVertexAttribPointer(normLoc, 3, GLES30.GL_FLOAT, false, 0, 0)
@@ -272,9 +313,11 @@ class HandRenderer {
         val vbo = IntArray(1); GLES30.glGenBuffers(1, vbo, 0)
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo[0])
         GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, verts.size * 4, buf, GLES30.GL_DYNAMIC_DRAW)
-        val loc = GLES30.glGetAttribLocation(lineProgram, "aPosition")
-        GLES30.glEnableVertexAttribArray(loc)
-        GLES30.glVertexAttribPointer(loc, 3, GLES30.GL_FLOAT, false, 0, 0)
+        val loc = lineLoc["aPosition"] ?: -1
+        if (loc >= 0) {
+            GLES30.glEnableVertexAttribArray(loc)
+            GLES30.glVertexAttribPointer(loc, 3, GLES30.GL_FLOAT, false, 0, 0)
+        }
         GLES30.glDrawArrays(mode, 0, verts.size / 3)
         GLES30.glDeleteBuffers(1, vbo, 0)
     }

@@ -153,10 +153,16 @@ class PersonalModelStore(private val context: Context) {
         val entry = buildHistoryEntry(System.currentTimeMillis(), biometrics)
         context.modelDataStore.edit { prefs ->
             val existing = prefs[KEY_BIOMETRIC_HISTORY] ?: "[]"
-            val entries  = parseHistoryRaw(existing).toMutableList()
-            entries.add(0, entry)                          // newest first
-            if (entries.size > MAX_HISTORY_ENTRIES) entries.subList(MAX_HISTORY_ENTRIES, entries.size).clear()
-            prefs[KEY_BIOMETRIC_HISTORY] = entriesToJson(entries)
+            // Keep the history as raw JSON strings throughout — avoids the type mismatch
+            // that occurred when mixing parseHistoryEntries (→ List<BiometricHistoryEntry>)
+            // with entriesToJson (takes List<String>).
+            val rawEntries = splitTopLevelObjects(
+                existing.trim().removePrefix("[").removeSuffix("]").trim()
+            ).toMutableList()
+            rawEntries.add(0, entry)
+            if (rawEntries.size > MAX_HISTORY_ENTRIES)
+                rawEntries.subList(MAX_HISTORY_ENTRIES, rawEntries.size).clear()
+            prefs[KEY_BIOMETRIC_HISTORY] = entriesToJson(rawEntries)
         }
     }
 
@@ -175,35 +181,35 @@ class PersonalModelStore(private val context: Context) {
     private fun buildHistoryEntry(ts: Long, b: HandBiometrics): String =
         """{"ts":$ts,"biometrics":${b.toJson()}}"""
 
-    private fun parseHistoryEntries(json: String): List<BiometricHistoryEntry> { return try {
-        // Minimal hand-rolled parser: split top-level array elements.
-        // We avoid a JSON library dependency to stay within existing constraints.
-        val stripped = json.trim().removePrefix("[").removeSuffix("]").trim()
-        if (stripped.isEmpty()) return emptyList()
+    private fun parseHistoryEntries(json: String): List<BiometricHistoryEntry> {
+        return try {
+            val stripped = json.trim().removePrefix("[").removeSuffix("]").trim()
+            if (stripped.isEmpty()) return emptyList()
 
-        // Split on "},{"  (the boundary between adjacent objects in the array)
-        val rawEntries = splitTopLevelObjects(stripped)
-        rawEntries.mapNotNull { raw ->
-            val obj = raw.trim().let { if (it.startsWith("{")) it else "{$it" }
-                                .let { if (it.endsWith("}")) it else "$it}" }
-            val ts = extractLong(obj, "ts") ?: return@mapNotNull null
-            // The biometrics sub-object starts after ""biometrics":"
-            val bmStart = obj.indexOf(""biometrics"")
-            if (bmStart < 0) return@mapNotNull null
-            val braceIdx = obj.indexOf("{", bmStart)
-            if (braceIdx < 0) return@mapNotNull null
-            // Walk to matching closing brace
-            var depth = 0
-            var end   = braceIdx
-            for (i in braceIdx until obj.length) {
-                if (obj[i] == '{') depth++
-                if (obj[i] == '}') { depth--; if (depth == 0) { end = i; break } }
+            val rawEntries = splitTopLevelObjects(stripped)
+            rawEntries.mapNotNull { raw ->
+                val obj = raw.trim().let { if (it.startsWith("{")) it else "{$it" }
+                                    .let { if (it.endsWith("}")) it else "$it}" }
+                val ts = extractLong(obj, "ts") ?: return@mapNotNull null
+                // Fixed: use properly escaped ASCII double-quotes.
+                // The previous code used Unicode smart-quotes (U+201C/U+201D) which
+                // never match stored JSON, so every history entry parsed as null.
+                val bmStart = obj.indexOf("\"biometrics\"")
+                if (bmStart < 0) return@mapNotNull null
+                val braceIdx = obj.indexOf("{", bmStart)
+                if (braceIdx < 0) return@mapNotNull null
+                var depth = 0
+                var end   = braceIdx
+                for (i in braceIdx until obj.length) {
+                    if (obj[i] == '{') depth++
+                    if (obj[i] == '}') { depth--; if (depth == 0) { end = i; break } }
+                }
+                val bmJson = obj.substring(braceIdx, end + 1)
+                val bm     = HandBiometrics.fromJson(bmJson) ?: return@mapNotNull null
+                BiometricHistoryEntry(ts, bm)
             }
-            val bmJson = obj.substring(braceIdx, end + 1)
-            val bm     = HandBiometrics.fromJson(bmJson) ?: return@mapNotNull null
-            BiometricHistoryEntry(ts, bm)
-        }
-    } catch (_: Exception) { emptyList() } }
+        } catch (_: Exception) { emptyList() }
+    }
 
     /**
      * Split a JSON array body (without outer brackets) into individual object strings.
@@ -224,10 +230,6 @@ class PersonalModelStore(private val context: Context) {
 
     private fun extractLong(json: String, key: String): Long? =
         Regex(""""$key"\s*:\s*([\d]+)""").find(json)?.groupValues?.get(1)?.toLongOrNull()
-
-    /** D4 — Parse the stored JSON array into raw object strings (no deserialisation). */
-    private fun parseHistoryRaw(json: String): List<String> =
-        splitTopLevelObjects(json.trim().removePrefix("[").removeSuffix("]").trim())
 
     private fun entriesToJson(entries: List<String>): String =
         entries.joinToString(",", prefix = "[", postfix = "]")

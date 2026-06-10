@@ -345,8 +345,8 @@ class OscStreamer {
      */
     fun start(
         host:   String    = DEFAULT_HOST,
-        port:   Int       = defaultPortFor(this.schema),
-        schema: OscSchema = this.schema
+        schema: OscSchema = this.schema,
+        port:   Int       = defaultPortFor(schema)
     ) {
         if (isStreaming) stop()
 

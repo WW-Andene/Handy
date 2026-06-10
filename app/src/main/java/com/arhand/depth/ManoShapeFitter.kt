@@ -117,7 +117,7 @@ class ManoShapeFitter {
             if (lms.size < 21) continue
             for (segIdx in segments.indices) {
                 val (ai, bi) = segments[segIdx]
-                meanLengths[segIdx] = meanLengths[segIdx] + (lms[ai] - lms[bi]).length()
+                val d = (lms[ai] - lms[bi]).length(); meanLengths[segIdx] = meanLengths[segIdx] + d
             }
             validFrames++
         }

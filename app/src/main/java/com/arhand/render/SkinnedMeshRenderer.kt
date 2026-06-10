@@ -67,6 +67,23 @@ class SkinnedMeshRenderer {
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
+    // Cached uniform/attrib locations — populated once in init() after shader compilation.
+    // Avoids ~15 synchronous glGetUniformLocation driver calls per frame.
+    private val skinnedLoc = HashMap<String, Int>(32)
+
+    private fun cacheSkinnedLocations() {
+        for (name in listOf(
+            "uModel", "uView", "uProjection", "uNormalMatrix", "uBonePalette",
+            "uBaseColor", "uAlpha", "uTime", "uTorchOn",
+            "uAmbientColor", "uAmbientIntensity",
+            "uKeyDir", "uKeyColor", "uKeyIntensity",
+            "uRimDir", "uRimColor", "uRimIntensity",
+            "uSSSDir", "uSSSColor", "uSSSIntensity",
+            "uFillDir", "uFillColor", "uFillIntensity",
+            "uTorchPos", "uTorchColor", "uTorchIntensity", "uTorchAttenuation", "uCameraPos"
+        )) skinnedLoc[name] = GLES30.glGetUniformLocation(skinnedProgram, name)
+    }
+
     fun init() {
         skinnedProgram = buildProg(SKINNED_VERT, SKINNED_FRAG)
         ghostProgram   = buildProg(ShaderPrograms.PHONG_VERT, ShaderPrograms.PHONG_FRAG)
@@ -76,6 +93,8 @@ class SkinnedMeshRenderer {
         GLES30.glGenBuffers(1, skinVbo, 0)
         GLES30.glGenBuffers(1, wgtVbo,  0)
         GLES30.glGenBuffers(1, normVbo, 0)
+
+        cacheSkinnedLocations()
     }
 
     /**
@@ -141,14 +160,14 @@ class SkinnedMeshRenderer {
         GLES30.glUseProgram(skinnedProgram)
 
         // MVP
-        GLES30.glUniformMatrix4fv(loc(skinnedProgram, "uModel"),      1, false, model, 0)
-        GLES30.glUniformMatrix4fv(loc(skinnedProgram, "uView"),       1, false, view,  0)
-        GLES30.glUniformMatrix4fv(loc(skinnedProgram, "uProjection"), 1, false, proj,  0)
+        GLES30.glUniformMatrix4fv(skinnedLoc["uModel"]!!,      1, false, model, 0)
+        GLES30.glUniformMatrix4fv(skinnedLoc["uView"]!!,       1, false, view,  0)
+        GLES30.glUniformMatrix4fv(skinnedLoc["uProjection"]!!, 1, false, proj,  0)
 
         // Bone palette — 16 matrices × 16 floats = 256 floats
         val palette = bonePalette
         GLES30.glUniformMatrix4fv(
-            loc(skinnedProgram, "uBonePalette"),
+            skinnedLoc["uBonePalette"]!!,
             BoneRetargeter.JOINT_COUNT,
             false,
             palette,
@@ -158,10 +177,10 @@ class SkinnedMeshRenderer {
         // Lighting uniforms (reuse LightingModel constants)
         setLightingUniforms(skinnedProgram, torchOn, timeSec)
 
-        GLES30.glUniform3fv(loc(skinnedProgram, "uBaseColor"), 1, floatArrayOf(0.824f, 0.667f, 0.471f), 0)
-        GLES30.glUniform1f(loc(skinnedProgram, "uAlpha"), 0.97f)
-        GLES30.glUniform1f(loc(skinnedProgram, "uTime"), timeSec)
-        GLES30.glUniform1i(loc(skinnedProgram, "uTorchOn"), if (torchOn) 1 else 0)
+        GLES30.glUniform3fv(skinnedLoc["uBaseColor"]!!, 1, floatArrayOf(0.824f, 0.667f, 0.471f), 0)
+        GLES30.glUniform1f(skinnedLoc["uAlpha"]!!, 0.97f)
+        GLES30.glUniform1f(skinnedLoc["uTime"]!!, timeSec)
+        GLES30.glUniform1i(skinnedLoc["uTorchOn"]!!, if (torchOn) 1 else 0)
 
         // Bind VAO and draw
         GLES30.glBindVertexArray(vaoHandle[0])
@@ -202,10 +221,10 @@ class SkinnedMeshRenderer {
 
         GLES30.glBindVertexArray(vaoHandle[0])
 
-        uploadFloatVbo(posVbo[0],  pos,     3, attribLoc(skinnedProgram, "aPosition"))
-        uploadFloatVbo(normVbo[0], normals, 3, attribLoc(skinnedProgram, "aNormal"))
-        uploadFloatVboFromInts(skinVbo[0], joints,  4, attribLoc(skinnedProgram, "aJoints"))
-        uploadFloatVbo(wgtVbo[0],  weights, 4, attribLoc(skinnedProgram, "aWeights"))
+        uploadFloatVbo(posVbo[0],  pos,     3, GLES30.glGetAttribLocation(skinnedProgram, "aPosition"))
+        uploadFloatVbo(normVbo[0], normals, 3, GLES30.glGetAttribLocation(skinnedProgram, "aNormal"))
+        uploadFloatVboFromInts(skinVbo[0], joints,  4, GLES30.glGetAttribLocation(skinnedProgram, "aJoints"))
+        uploadFloatVbo(wgtVbo[0],  weights, 4, GLES30.glGetAttribLocation(skinnedProgram, "aWeights"))
 
         GLES30.glBindVertexArray(0)
     }
@@ -230,8 +249,8 @@ class SkinnedMeshRenderer {
 
     private fun setLightingUniforms(prog: Int, torchOn: Boolean, timeSec: Float) {
         val L = LightingModel
-        fun v3(name: String, v: FloatArray) = GLES30.glUniform3fv(loc(prog, name), 1, v, 0)
-        fun f1(name: String, v: Float)      = GLES30.glUniform1f(loc(prog, name), v)
+        fun v3(name: String, v: FloatArray) = GLES30.glUniform3fv(skinnedLoc[name]!!, 1, v, 0)
+        fun f1(name: String, v: Float)      = GLES30.glUniform1f(skinnedLoc[name]!!, v)
 
         v3("uAmbientColor",    L.ambientColor);  f1("uAmbientIntensity", L.ambientIntensity)
         v3("uKeyDir",  L.keyDir);   v3("uKeyColor",  L.keyColor);  f1("uKeyIntensity",  L.keyIntensity)
@@ -240,15 +259,12 @@ class SkinnedMeshRenderer {
         v3("uFillDir", L.fillDir);  v3("uFillColor", L.fillColor); f1("uFillIntensity", L.fillIntensity)
         v3("uTorchPos",   floatArrayOf(0f, 0.2f, 0.5f))
         v3("uTorchColor", L.torchColor); f1("uTorchIntensity", L.torchIntensity)
-        GLES30.glUniform3fv(loc(prog, "uTorchAttenuation"), 1, L.torchAttenuation, 0)
+        GLES30.glUniform3fv(skinnedLoc["uTorchAttenuation"]!!, 1, L.torchAttenuation, 0)
         v3("uCameraPos", floatArrayOf(0f, 0f, 5f))
         f1("uTime", timeSec)
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
-
-    private fun loc(prog: Int, name: String) = GLES30.glGetUniformLocation(prog, name)
-    private fun attribLoc(prog: Int, name: String) = GLES30.glGetAttribLocation(prog, name)
 
     private fun computeFlatNormals(positions: FloatArray): FloatArray {
         val normals = FloatArray(positions.size)

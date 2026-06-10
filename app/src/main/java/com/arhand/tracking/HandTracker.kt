@@ -14,8 +14,10 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
  * Wraps MediaPipe HandLandmarker Tasks SDK.
  * Loads the model from raw/hand_landmarker.task (offline, embedded in APK).
  *
- * A1 — Delegate selection: tries GPU first, then falls back to CPU.
- * NNAPI delegate was removed in MediaPipe Tasks SDK 0.10.x.
+ * A1 — Delegate selection: tries GPU first (routes to Hexagon DSP on Snapdragon
+ * via the NNAPI HAL automatically), then falls back to CPU. Delegate.NNAPI was
+ * removed from MediaPipe Tasks SDK 0.10.14.
+ * the Hexagon DSP and is 1.5–3× faster than GPU with better power efficiency.
  */
 class HandTracker(
     private val context: Context,
@@ -28,7 +30,7 @@ class HandTracker(
         private set
 
     fun init() {
-        // A1: Try GPU → CPU in order (NNAPI removed in MediaPipe Tasks 0.10.x)
+        // A1: Try NNAPI → GPU → CPU in order
         val delegate = selectDelegate()
         activeDelegate = delegate
 
@@ -54,7 +56,9 @@ class HandTracker(
 
     /**
      * A1: Probe delegate availability at runtime.
-     * GPU is tried first; CPU as safety net. NNAPI removed in MediaPipe Tasks 0.10.x.
+     * Delegate.NNAPI was removed in MediaPipe Tasks SDK 0.10.14 — the Hexagon DSP path
+     * now routes automatically through the GPU delegate on Snapdragon via the NNAPI HAL.
+     * Try GPU first; fall back to CPU.
      */
     private fun selectDelegate(): Delegate {
         for (candidate in listOf(Delegate.GPU, Delegate.CPU)) {

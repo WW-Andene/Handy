@@ -152,11 +152,17 @@ class LiveMeshDeformer {
 
         // Build bone palette: skinMatrix[j] = jointMat[j] × inverseBindMatrix[j]
         val palette = Array(JOINT_COUNT) { ji ->
-            val rot   = result.jointRotations[ji] ?: com.arhand.mocap.Quaternion.IDENTITY
-            val jMat  = rot.toMatrix()
+            val rot  = result.jointRotations[ji] ?: com.arhand.mocap.Quaternion.IDENTITY
+            val jMat = rot.toMatrix()
 
-            // Apply wrist translation to joint 0
-            if (ji == JOINT_WRIST) {
+            // Set joint world-space translation from jointPositions.
+            // Previously only JOINT_WRIST got a translation — all other joints had
+            // m[12..14]=0, making finger bones pivot around the world origin instead of
+            // their own pivots.  Now every joint uses its tracked world position.
+            val jPos = result.jointPositions[ji]
+            if (jPos != null) {
+                jMat[12] = jPos.x; jMat[13] = jPos.y; jMat[14] = jPos.z
+            } else if (ji == JOINT_WRIST) {
                 val t = result.wristTransform.position
                 jMat[12] = t.x; jMat[13] = t.y; jMat[14] = t.z
             }
