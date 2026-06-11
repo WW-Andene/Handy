@@ -1046,7 +1046,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         port:   Int       = OscStreamer.defaultPortFor(uiState.value.oscSchema),
         schema: OscSchema = uiState.value.oscSchema
     ) {
-        oscStreamer.start(host, port, schema)
+        oscStreamer.start(host, schema, port)
         uiState.update { it.copy(isOscStreaming = true, oscHost = host, oscPort = port, oscSchema = schema) }
     }
 

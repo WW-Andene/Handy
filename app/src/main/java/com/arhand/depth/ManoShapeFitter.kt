@@ -122,7 +122,7 @@ class ManoShapeFitter {
             validFrames++
         }
         if (validFrames == 0) return ShapeParams(FloatArray(N_SEGMENTS) { 1f }, 0.10f, FloatArray(5) { 1f })
-        for (i in meanLengths.indices) meanLengths[i] /= validFrames
+        for (i in meanLengths.indices) meanLengths[i] /= validFrames.toFloat()
 
         // ── Step 2: Palm size normalization ───────────────────────────────
         // Palm size = distance from wrist (0) to middle MCP (9)
