@@ -9,6 +9,126 @@ import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+// ─── Asset slot ──────────────────────────────────────────────────────────────
+
+/**
+ * ASSET-2 — Identifies how a loaded GLB is to be used by the retargeting pipeline.
+ *
+ * Auto-detected in [AssetLoader.detectSlot] by inspecting the parsed joint list.
+ * Hand rigs have ≤ 20 joints; full-body rigs have ≥ 21 and include spine/hip names.
+ */
+enum class AssetSlot {
+    /** Default hand puppet — 16 joints max, hand-only retargeting. */
+    HAND_PUPPET,
+    /** User-uploaded full-body GLB/VRM — spine, hips, arms, legs present. */
+    BODY_CHARACTER
+}
+
+// ─── Body joint enum ─────────────────────────────────────────────────────────
+
+/**
+ * ASSET-4 — Unity HumanBodyBones naming for full-body retargeting.
+ *
+ * Used as the key in [LoadedAsset.bodyJointMap] and [BodyRetargetResult.joints].
+ * Names match VMC v2.3 /VMC/Ext/Bon/Rot bone name strings exactly.
+ */
+enum class BodyJoint(val vmcName: String) {
+    HIPS            ("Hips"),
+    SPINE           ("Spine"),
+    CHEST           ("Chest"),
+    NECK            ("Neck"),
+    HEAD            ("Head"),
+    LEFT_UPPER_ARM  ("LeftUpperArm"),
+    LEFT_LOWER_ARM  ("LeftLowerArm"),
+    RIGHT_UPPER_ARM ("RightUpperArm"),
+    RIGHT_LOWER_ARM ("RightLowerArm"),
+    LEFT_UPPER_LEG  ("LeftUpperLeg"),
+    LEFT_LOWER_LEG  ("LeftLowerLeg"),
+    RIGHT_UPPER_LEG ("RightUpperLeg"),
+    RIGHT_LOWER_LEG ("RightLowerLeg"),
+    LEFT_FOOT       ("LeftFoot"),
+    RIGHT_FOOT      ("RightFoot")
+}
+
+// ─── VRM joint name mapper ───────────────────────────────────────────────────
+
+/**
+ * ASSET-4 — Maps known VRM / Mixamo / Unreal bone name variants to [BodyJoint] slots.
+ *
+ * Covers:
+ *   - VRM 0.x  : J_Bip_C_Hips, J_Bip_L_UpperArm, …
+ *   - VRM 1.0  : hips, leftUpperArm, …  (camelCase)
+ *   - Mixamo   : mixamorig:Hips, mixamorig:LeftArm, …
+ *   - Unreal   : pelvis, upperarm_l, …
+ *   - Generic  : Hips, Spine, Chest, LeftUpperArm, … (Unity default)
+ *
+ * Matching is case-insensitive and strips common prefixes before lookup.
+ */
+object VrmJointMapper {
+
+    /** Returns the [BodyJoint] for a glTF node name, or null if not recognised. */
+    fun map(nodeName: String): BodyJoint? {
+        val n = normalise(nodeName)
+        return TABLE[n]
+    }
+
+    private fun normalise(raw: String): String =
+        raw.lowercase()
+            .removePrefix("j_bip_c_")
+            .removePrefix("j_bip_l_")
+            .removePrefix("j_bip_r_")
+            .removePrefix("mixamorig:")
+            .removePrefix("mixamorig_")
+            .replace("_", "")
+            .replace("-", "")
+            .replace(" ", "")
+
+    private val TABLE: Map<String, BodyJoint> = buildMap {
+        // ── Hips / Pelvis ──────────────────────────────────────────────────
+        for (k in listOf("hips","hip","pelvis","root")) put(k, BodyJoint.HIPS)
+
+        // ── Spine ──────────────────────────────────────────────────────────
+        for (k in listOf("spine","spine1","spine01","lowerback")) put(k, BodyJoint.SPINE)
+
+        // ── Chest ──────────────────────────────────────────────────────────
+        for (k in listOf("chest","spine2","spine02","upperchest","thorax")) put(k, BodyJoint.CHEST)
+
+        // ── Neck ───────────────────────────────────────────────────────────
+        for (k in listOf("neck","neck1","neck01")) put(k, BodyJoint.NECK)
+
+        // ── Head ───────────────────────────────────────────────────────────
+        for (k in listOf("head","head1")) put(k, BodyJoint.HEAD)
+
+        // ── Left arm ───────────────────────────────────────────────────────
+        for (k in listOf("leftupperarm","leftarm","lupperarm","larm","arm_l","upperarml",
+                         "shoulder_l","leftshoulder")) put(k, BodyJoint.LEFT_UPPER_ARM)
+        for (k in listOf("leftlowerarm","leftforearm","lforearm","lowerarml","forearm_l",
+                         "elbow_l","leftforearm")) put(k, BodyJoint.LEFT_LOWER_ARM)
+
+        // ── Right arm ──────────────────────────────────────────────────────
+        for (k in listOf("rightupperarm","rightarm","rupperarm","rarm","arm_r","upperarmr",
+                         "shoulder_r","rightshoulder")) put(k, BodyJoint.RIGHT_UPPER_ARM)
+        for (k in listOf("rightlowerarm","rightforearm","rforearm","lowerarmr","forearm_r",
+                         "elbow_r","rightforearm")) put(k, BodyJoint.RIGHT_LOWER_ARM)
+
+        // ── Left leg ───────────────────────────────────────────────────────
+        for (k in listOf("leftupperleg","leftthigh","lthigh","lupperleg","thigh_l",
+                         "upleg_l","leftupleg")) put(k, BodyJoint.LEFT_UPPER_LEG)
+        for (k in listOf("leftlowerleg","leftshin","lshin","llowerleg","shin_l",
+                         "leg_l","calf_l","leftleg")) put(k, BodyJoint.LEFT_LOWER_LEG)
+
+        // ── Right leg ──────────────────────────────────────────────────────
+        for (k in listOf("rightupperleg","rightthigh","rthigh","rupperleg","thigh_r",
+                         "upleg_r","rightupleg")) put(k, BodyJoint.RIGHT_UPPER_LEG)
+        for (k in listOf("rightlowerleg","rightshin","rshin","rlowerleg","shin_r",
+                         "leg_r","calf_r","rightleg")) put(k, BodyJoint.RIGHT_LOWER_LEG)
+
+        // ── Feet ───────────────────────────────────────────────────────────
+        for (k in listOf("leftfoot","lfoot","foot_l","ankle_l")) put(k, BodyJoint.LEFT_FOOT)
+        for (k in listOf("rightfoot","rfoot","foot_r","ankle_r")) put(k, BodyJoint.RIGHT_FOOT)
+    }
+}
+
 /**
  * Loads a user-provided GLB asset from storage, extracts its skin joint hierarchy and
  * inverse bind matrices, and produces a [LoadedAsset] ready for [BoneRetargeter] and
@@ -53,6 +173,53 @@ object AssetLoader {
             context.contentResolver.openInputStream(uri)?.use { stream ->
                 parseGlb(stream)
             } ?: DEFAULT_PUPPET
+        } catch (e: Exception) {
+            DEFAULT_PUPPET
+        }
+    }
+
+    /**
+     * ASSET-3 — Load a [LoadedAsset] bundled in the APK's assets/ folder.
+     *
+     * @param context  Android context for [android.content.res.AssetManager] access.
+     * @param filename Relative path inside assets/ (e.g. "models/hand_default.glb").
+     */
+    fun loadFromAssets(context: Context, filename: String): LoadedAsset {
+        return try {
+            context.assets.open(filename).use { stream -> parseGlb(stream) }
+        } catch (e: Exception) {
+            DEFAULT_PUPPET
+        }
+    }
+
+    /**
+     * ASSET-2 — Infer the [AssetSlot] from a loaded asset's joint count and topology.
+     *
+     * Heuristic: full-body rigs have ≥ 21 joints. Hand-only rigs have ≤ 20.
+     * This is conservative — a hand rig will never be misclassified as body.
+     */
+    fun detectSlot(asset: LoadedAsset): AssetSlot =
+        if (asset.jointCount >= 21) AssetSlot.BODY_CHARACTER else AssetSlot.HAND_PUPPET
+
+    /** Bundled asset paths inside assets/models/ (fallback) and generated paths. */
+    object Bundled {
+        const val HAND_GLB      = "models/hand_default.glb"
+        const val BODY_GLB      = "models/body_default.glb"
+        val ALL = listOf(
+            "Hand (built-in)"  to HAND_GLB,
+            "Body (built-in)"  to BODY_GLB
+        )
+    }
+
+    /**
+     * Item 3 — Load a bundled GLB from an absolute filesystem path.
+     * Used for procedurally generated assets in cacheDir/models/.
+     *
+     * @param path Absolute path to the .glb file.
+     */
+    fun loadFromPath(path: String): LoadedAsset {
+        return try {
+            java.io.File(path).inputStream().use { stream -> parseGlb(stream) }
         } catch (e: Exception) {
             DEFAULT_PUPPET
         }
@@ -104,13 +271,16 @@ object AssetLoader {
         val skins = root.optJSONArray("skins")
         if (skins == null || skins.length() == 0) {
             // No skeleton — use mesh with symmetric bind pose
-            return LoadedAsset(
+            val asset = LoadedAsset(
                 meshPositions = meshPositions,
                 jointNodeIndices = emptyList(),
                 inverseBindMatrices = emptyList(),
                 bindPose = BoneRetargeter.symmetricBindPose(),
-                hasSkin = false
+                hasSkin = false,
+                slot = AssetSlot.HAND_PUPPET,
+                bodyJointMap = emptyMap()
             )
+            return asset
         }
 
         val skin        = skins.getJSONObject(0)
@@ -129,12 +299,17 @@ object AssetLoader {
         // Derive bind pose bone directions from the inverse bind matrices
         val bindPose = deriveBindPose(root, jointNodeIndices, ibmList)
 
+        val slot = if (jointNodeIndices.size >= 21) AssetSlot.BODY_CHARACTER else AssetSlot.HAND_PUPPET
+
         return LoadedAsset(
             meshPositions       = meshPositions,
             jointNodeIndices    = jointNodeIndices,
             inverseBindMatrices = ibmList,
             bindPose            = bindPose,
-            hasSkin             = true
+            hasSkin             = true,
+            slot                = slot,
+            bodyJointMap        = buildBodyJointMap(root, jointNodeIndices),
+            blendShapeMap       = VrmBlendShapeParser.parse(root)
         )
     }
 
@@ -275,6 +450,33 @@ object AssetLoader {
         return BindPose(dirs, wristPos)
     }
 
+    // ─── ASSET-4: Body joint map ──────────────────────────────────────────────
+
+    /**
+     * Walk the glTF nodes array and map any node whose name is recognised by
+     * [VrmJointMapper] to its glTF node index.
+     *
+     * Returns an empty map for hand-only rigs (< 21 joints) — the caller checks
+     * [LoadedAsset.slot] before using this map.
+     */
+    private fun buildBodyJointMap(
+        root: JSONObject,
+        jointNodeIndices: List<Int>
+    ): Map<BodyJoint, Int> {
+        if (jointNodeIndices.size < 21) return emptyMap()
+        val nodes = root.optJSONArray("nodes") ?: return emptyMap()
+        val result = mutableMapOf<BodyJoint, Int>()
+        for (nodeIdx in jointNodeIndices) {
+            if (nodeIdx >= nodes.length()) continue
+            val name = nodes.getJSONObject(nodeIdx).optString("name", "")
+            if (name.isEmpty()) continue
+            val joint = VrmJointMapper.map(name) ?: continue
+            // First match wins — prevents duplicate assignments if rig has alias nodes
+            result.putIfAbsent(joint, nodeIdx)
+        }
+        return result
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     private fun identityMatrix(): FloatArray = floatArrayOf(
@@ -299,7 +501,9 @@ object AssetLoader {
         jointNodeIndices    = emptyList(),
         inverseBindMatrices = emptyList(),
         bindPose            = BoneRetargeter.symmetricBindPose(),
-        hasSkin             = false
+        hasSkin             = false,
+        slot                = AssetSlot.HAND_PUPPET,
+        bodyJointMap        = emptyMap()
     )
 }
 
@@ -338,7 +542,31 @@ data class LoadedAsset(
     val bindPose: BindPose,
 
     /** False when asset has no skin — retargeting still works via symmetric bind pose. */
-    val hasSkin: Boolean
+    val hasSkin: Boolean,
+
+    /**
+     * ASSET-2 — Which retargeting slot this asset occupies.
+     * Auto-detected by [AssetLoader.detectSlot] at load time.
+     */
+    val slot: AssetSlot = AssetSlot.HAND_PUPPET,
+
+    /**
+     * ASSET-4 — Maps [BodyJoint] enum values to glTF node indices in this asset's skeleton.
+     *
+     * Built by [AssetLoader] by matching glTF node names against [VrmJointMapper].
+     * Null or empty for hand-only assets. Used by [SkinnedMeshRenderer] to drive body
+     * bone matrices from [BodyRetargetResult] once BODY-1 is implemented.
+     */
+    val bodyJointMap: Map<BodyJoint, Int> = emptyMap(),
+
+    /**
+     * FACE-1 — VRM blend shape map parsed from `extensions.VRM.blendShapeMaster`.
+     *
+     * Null when the asset has no VRM extension or no recognised blend shape groups.
+     * Used by [VrmBlendShapeParser.resolve] to convert [FaceExpressions] values into
+     * morph target weight applications each frame.
+     */
+    val blendShapeMap: BlendShapeMap? = null
 ) {
     /** Number of skin joints. */
     val jointCount: Int get() = jointNodeIndices.size

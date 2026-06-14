@@ -320,20 +320,22 @@ class OscReceiver {
         val start = bb.position()
         val bytes = bb.array()
         val arrayOffset = bb.arrayOffset()
+
+        // Using start + bb.remaining() is wrong on the second readOscString call within
+        // the same message — remaining() decreases as the buffer is consumed, making the
+        // bound smaller than the actual available data. The absolute limit is always correct.
+        val absoluteLimit = arrayOffset + bb.limit()
         var end = start
-        while (end < start + bb.remaining()) {
+        while (arrayOffset + end < absoluteLimit) {
             if (bytes[arrayOffset + end] == 0.toByte()) break
             end++
         }
-        if (end >= start + bb.remaining() && bytes.getOrNull(arrayOffset + end) != 0.toByte()) {
-            return null  // no null terminator found
-        }
+        if (arrayOffset + end >= absoluteLimit) return null  // no null terminator found
         val str = String(bytes, arrayOffset + start, end - start, StandardCharsets.US_ASCII)
-        // Advance past null terminator + padding to 4-byte boundary
-        val rawLen   = end - start + 1   // include the null byte
-        val padded   = (rawLen + 3) / 4 * 4
-        val newPos   = start + padded
-        if (newPos > start + bb.remaining()) return null
+        val rawLen = end - start + 1   // include null byte
+        val padded = (rawLen + 3) / 4 * 4
+        val newPos = start + padded
+        if (newPos > bb.limit()) return null
         bb.position(newPos)
         return str
     }

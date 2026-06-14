@@ -8,6 +8,7 @@ import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
+import android.view.WindowManager
 
 /**
  * Camera2 pipeline.
@@ -34,6 +35,7 @@ class CameraController(
     private var cameraHandler: Handler? = null
 
     private var currentFacing = CameraCharacteristics.LENS_FACING_FRONT
+    private var sensorOrientation = 0
 
     @SuppressLint("MissingPermission")
     fun start(facing: Int = CameraCharacteristics.LENS_FACING_FRONT) {
@@ -47,6 +49,25 @@ class CameraController(
             val chars = cameraManager.getCameraCharacteristics(id)
             chars.get(CameraCharacteristics.LENS_FACING) == facing
         }
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+
+        // Display rotation compensates for the device's current physical orientation.
+        // SENSOR_ORIENTATION alone is only correct when the device is in its natural
+        // (portrait) orientation. When the user holds the device landscape or upside-down,
+        // the frame arrives pre-rotated by the sensor but the display has also rotated —
+        // we must add both angles so MediaPipe always receives an upright image.
+        @Suppress("DEPRECATION")
+        val displayRotationDeg = when (
+            (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
+                .defaultDisplay.rotation
+        ) {
+            Surface.ROTATION_90  -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else                 -> 0
+        }
+        frameProvider.rotationDegrees = (sensorOrientation + displayRotationDeg) % 360
 
         imageReader = ImageReader.newInstance(TARGET_WIDTH, TARGET_HEIGHT, ImageFormat.YUV_420_888, 4)
         imageReader!!.setOnImageAvailableListener({ reader ->

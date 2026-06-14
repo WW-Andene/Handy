@@ -14,4 +14,16 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Handy"
-include(":app")
+
+// R2 — Gradle module split
+// Each module compiles independently; incremental builds only rebuild affected modules.
+// Dependency graph: util ← tracking ← depth ← scanner ← mocap ← render ← export ← app
+include ':app'
+include ':util'
+include ':tracking'
+include ':depth'
+include ':scanner'
+include ':mocap'
+include ':render'
+include ':export'
+include ':camera'

@@ -27,7 +27,10 @@ class HandTrackerManager(
     fun init() {
         if (tracker != null) return
         tracker = HandTracker(context) { result, timestamp ->
-            val rawHands = tracker!!.parseResult(result)
+
+            // (config change, camera restart), tracker may be null by the time we use it.
+            val t = tracker ?: return@HandTracker
+            val rawHands = t.parseResult(result)
             val conf = if (result.handedness().isNotEmpty())
                 result.handedness()[0].firstOrNull()?.score() ?: 0.5f
             else 0f

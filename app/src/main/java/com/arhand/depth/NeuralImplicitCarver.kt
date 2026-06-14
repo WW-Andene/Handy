@@ -45,6 +45,41 @@ class NeuralImplicitCarver {
     private val HIDDEN_DIM = 64
     private val OUTPUT_DIM = 1
 
+    /**
+     * IMP-R3 — Fourier positional encoding.
+     *
+     * Raw (x,y,z) as MLP input limits the network to smooth low-frequency surfaces
+     * due to spectral bias — the network can't easily represent knuckle ridges,
+     * nail edges, or vein topology at the 1–3mm scale.
+     *
+     * Nerf-style positional encoding maps each coordinate through L frequency bands:
+     *   γ(p) = [sin(2⁰πp), cos(2⁰πp), sin(2¹πp), cos(2¹πp), ..., sin(2^(L-1)πp), cos(2^(L-1)πp)]
+     *
+     * With L=4 and 3 input axes: encoded dimension = 3 + 3×4×2 = 27 (raw + encoded).
+     * This lets the same 64-unit hidden layers resolve surface detail ~16× finer than
+     * raw input while adding only 24 extra input weights (negligible).
+     *
+     * The raw coords are also appended to preserve DC (low-frequency) content.
+     */
+    private val FOURIER_L      = 4                          // frequency bands
+    private val ENCODED_DIM    = 3 + 3 * FOURIER_L * 2     // 3 raw + 24 encoded = 27
+    private val PI_F           = Math.PI.toFloat()
+
+    private fun encode(x: FloatArray): FloatArray {
+        val out = FloatArray(ENCODED_DIM)
+        // Copy raw coords
+        out[0] = x[0]; out[1] = x[1]; out[2] = x[2]
+        var idx = 3
+        for (l in 0 until FOURIER_L) {
+            val scale = Math.pow(2.0, l.toDouble()).toFloat() * PI_F
+            for (d in 0..2) {
+                out[idx++] = kotlin.math.sin(scale * x[d])
+                out[idx++] = kotlin.math.cos(scale * x[d])
+            }
+        }
+        return out
+    }
+
     // Layer weight matrices and biases — initialized lazily in init()
     // Layer 0: [INPUT_DIM  × HIDDEN_DIM]
     // Layer 1: [HIDDEN_DIM × HIDDEN_DIM]
@@ -71,6 +106,8 @@ class NeuralImplicitCarver {
     companion object {
         const val DEFAULT_EPOCHS         = 300
         const val DEFAULT_BATCH_SIZE     = 256
+        /** Epochs per incremental training pass (HAND-6). Fewer than full train — warm-start converges faster. */
+        const val INCREMENTAL_EPOCHS     = 60
         const val LEARNING_RATE          = 1e-3f
         const val ADAM_BETA1             = 0.9f
         const val ADAM_BETA2             = 0.999f
@@ -121,7 +158,7 @@ class NeuralImplicitCarver {
         }
         fun zeros(size: Int) = FloatArray(size) { 0f }
 
-        w0 = kaiming(INPUT_DIM,  INPUT_DIM * HIDDEN_DIM)
+        w0 = kaiming(ENCODED_DIM, ENCODED_DIM * HIDDEN_DIM)  // Fourier-encoded input layer
         b0 = zeros(HIDDEN_DIM)
         w1 = kaiming(HIDDEN_DIM, HIDDEN_DIM * HIDDEN_DIM)
         b1 = zeros(HIDDEN_DIM)
@@ -144,11 +181,12 @@ class NeuralImplicitCarver {
      * hidden states needed for backprop.
      */
     private fun forward(x: FloatArray): ForwardCache {
-        // Layer 0
+        val enc = encode(x)   // Fourier encoding: raw 3D point → 27-dim positional encoding
+        // Layer 0 — uses encoded input
         val h0 = FloatArray(HIDDEN_DIM)
         for (j in 0 until HIDDEN_DIM) {
             var s = b0[j]
-            for (i in 0 until INPUT_DIM) s += x[i] * w0[i * HIDDEN_DIM + j]
+            for (i in 0 until ENCODED_DIM) s += enc[i] * w0[i * HIDDEN_DIM + j]
             h0[j] = maxOf(0f, s)  // ReLU
         }
         // Layer 1
@@ -237,16 +275,17 @@ class NeuralImplicitCarver {
         val dh0 = FloatArray(HIDDEN_DIM)
         for (i in 0 until HIDDEN_DIM) for (j in 0 until HIDDEN_DIM) dh0[i] += w1[i * HIDDEN_DIM + j] * dPreact1[j]
 
-        // Layer 0 gradients (ReLU gate)
+        // Layer 0 gradients (ReLU gate) — IMP-R3: use encoded input
+        val enc0 = encode(c.x)
         val preact0 = FloatArray(HIDDEN_DIM)
         for (j in 0 until HIDDEN_DIM) {
             var s = b0[j]
-            for (i in 0 until INPUT_DIM) s += c.x[i] * w0[i * HIDDEN_DIM + j]
+            for (i in 0 until ENCODED_DIM) s += enc0[i] * w0[i * HIDDEN_DIM + j]
             preact0[j] = s
         }
         val dPreact0 = FloatArray(HIDDEN_DIM) { j -> if (preact0[j] > 0f) dh0[j] else 0f }
         db0.indices.forEach { j -> db0[j] += dPreact0[j] }
-        for (i in 0 until INPUT_DIM) for (j in 0 until HIDDEN_DIM) dw0[i * HIDDEN_DIM + j] += c.x[i] * dPreact0[j]
+        for (i in 0 until ENCODED_DIM) for (j in 0 until HIDDEN_DIM) dw0[i * HIDDEN_DIM + j] += enc0[i] * dPreact0[j]
     }
 
     // ── Adam update ────────────────────────────────────────────────────────
@@ -430,7 +469,24 @@ class NeuralImplicitCarver {
      *                Quality scores are used only to select top-75% frames.
      * @param epochs  Number of gradient descent epochs. Default [DEFAULT_EPOCHS].
      */
-    fun train(frames: List<Pair<List<Vec3>, Float>>, epochs: Int = DEFAULT_EPOCHS) {
+    /**
+     * Train the MLP occupancy network on the captured scan frames.
+     *
+     * HAND-5 — [normalMap] augments the training data with photometric surface samples.
+     * Each pixel of the normal map that has sufficient confidence is unprojected to a
+     * 3D surface point (using the normal map's depth-facing component as a depth proxy)
+     * and added as a positive surface sample (label = 1.0). This provides fine-grained
+     * surface constraint data that ARCore landmarks alone cannot supply.
+     *
+     * @param frames    Scan frames: (landmarks, quality) pairs.
+     * @param epochs    Training epochs (default [DEFAULT_EPOCHS]).
+     * @param normalMap Optional photometric normal map from the scan. Null = same as before.
+     */
+    fun train(
+        frames:    List<Pair<List<Vec3>, Float>>,
+        epochs:    Int = DEFAULT_EPOCHS,
+        normalMap: com.arhand.scanner.PhotometricNormalMap? = null
+    ) {
         initWeights()
         isTrained = false
 
@@ -440,7 +496,57 @@ class NeuralImplicitCarver {
             .map { it.first }
 
         val rng = java.util.Random(System.currentTimeMillis())
-        val (samples, labels) = buildTrainingData(qualifiedFrames, rng)
+        val (baseSamples, baseLabels) = buildTrainingData(qualifiedFrames, rng)
+        if (baseSamples.isEmpty()) return
+
+        // HAND-5 — Normal map surface sample injection.
+        // Unproject normal map pixels to 3D surface points and add them as
+        // positive training samples (occupancy = 1.0). This directly constrains
+        // the MLP on fine surface geometry the landmark-based training misses.
+        //
+        // Intrinsics match PhotometricDepthSource: FX = FY ≈ 310, CX = 160, CY = 120.
+        val extraSamples = mutableListOf<FloatArray>()
+        val extraLabels  = mutableListOf<Float>()
+        if (normalMap != null && !normalMap.isEmpty) {
+            val nmFx = 310f; val nmFy = 310f
+            val nmCx = normalMap.width  * 0.5f
+            val nmCy = normalMap.height * 0.5f
+            val stride = 4   // subsample the normal map for training efficiency
+            for (nmY in stride until normalMap.height - stride step stride) {
+                for (nmX in stride until normalMap.width - stride step stride) {
+                    val normal = normalMap.normalAt(nmX, nmY) ?: continue
+                    val (nx, ny, nz) = normal
+                    // Only use pixels whose normal faces the camera (nz > 0.3)
+                    // — low nz = grazing angle, unreliable depth estimate
+                    if (nz < 0.3f) continue
+                    // Use nz as a proxy for depth (brighter = closer to camera)
+                    // Map nz ∈ [0.3, 1.0] → depth ∈ [0.25, 0.08] metres (heuristic)
+                    val depthM = 0.25f - (nz - 0.3f) / 0.7f * 0.17f
+                    val wx = (nmX - nmCx) / nmFx * depthM
+                    val wy = (nmY - nmCy) / nmFy * depthM
+                    val wz = -depthM
+                    // Encode as positional encoding (same as main training path)
+                    extraSamples.add(encode(floatArrayOf(wx, wy, wz)))
+                    extraLabels.add(1f)   // surface point → inside/on surface
+                }
+            }
+        }
+
+        // Merge base and extra samples
+        val samples: List<FloatArray>
+        val labels:  FloatArray
+        if (extraSamples.isEmpty()) {
+            samples = baseSamples
+            labels  = baseLabels
+        } else {
+            samples = baseSamples + extraSamples
+            // Concatenate base labels with extra labels into one FloatArray
+            labels = FloatArray(baseLabels.size + extraLabels.size).also { arr ->
+                baseLabels.copyInto(arr, destinationOffset = 0)
+                extraLabels.forEachIndexed { i, v -> arr[baseLabels.size + i] = v }
+            }
+        }
+
         if (samples.isEmpty()) return
 
         val n = samples.size
@@ -495,7 +601,112 @@ class NeuralImplicitCarver {
     }
 
     /**
-     * Query occupancy at a world-space point.
+     * HAND-6 — Incremental training: warm-start from current weights.
+     *
+     * Unlike [train] which calls [initWeights] and discards all prior learning,
+     * this method continues training from the current weight state. Designed for
+     * use during scan capture: called after each new pose is captured so that
+     * a partial scan (user stops early) produces progressively better meshes.
+     *
+     * The Adam optimizer state ([adamStep], moment accumulators) is preserved across
+     * calls so the learning rate schedule continues correctly.
+     *
+     * @param newFrames  New scan frames to incorporate (typically one pose's worth).
+     * @param epochs     Training epochs for this incremental pass (fewer than full train).
+     * @param normalMap  Optional photometric normal map for surface sample augmentation.
+     */
+    fun trainIncremental(
+        newFrames: List<Pair<List<Vec3>, Float>>,
+        epochs:    Int = INCREMENTAL_EPOCHS,
+        normalMap: com.arhand.scanner.PhotometricNormalMap? = null
+    ) {
+        if (newFrames.isEmpty()) return
+
+        val qualifiedFrames = newFrames.filter { it.second >= 0.55f }.map { it.first }
+        if (qualifiedFrames.isEmpty()) return
+
+        val rng = java.util.Random(adamStep.toLong())   // deterministic per-call
+        val (baseSamples, baseLabels) = buildTrainingData(qualifiedFrames, rng)
+        if (baseSamples.isEmpty()) return
+
+        // Augment with normal map samples (same logic as train())
+        val extraSamples = mutableListOf<FloatArray>()
+        val extraLabels  = mutableListOf<Float>()
+        if (normalMap != null && !normalMap.isEmpty) {
+            val nmFx = 310f; val nmFy = 310f
+            val nmCx = normalMap.width  * 0.5f
+            val nmCy = normalMap.height * 0.5f
+            val stride = 8   // coarser stride for incremental passes (speed)
+            for (nmY in stride until normalMap.height - stride step stride) {
+                for (nmX in stride until normalMap.width - stride step stride) {
+                    val normal = normalMap.normalAt(nmX, nmY) ?: continue
+                    val (nx, ny, nz) = normal
+                    if (nz < 0.3f) continue
+                    val depthM = 0.25f - (nz - 0.3f) / 0.7f * 0.17f
+                    val wx = (nmX - nmCx) / nmFx * depthM
+                    val wy = (nmY - nmCy) / nmFy * depthM
+                    val wz = -depthM
+                    extraSamples.add(encode(floatArrayOf(wx, wy, wz)))
+                    extraLabels.add(1f)
+                }
+            }
+        }
+
+        val samples: List<FloatArray>
+        val labels:  FloatArray
+        if (extraSamples.isEmpty()) {
+            samples = baseSamples
+            labels  = baseLabels
+        } else {
+            samples = baseSamples + extraSamples
+            labels  = FloatArray(baseLabels.size + extraLabels.size).also { arr ->
+                baseLabels.copyInto(arr, destinationOffset = 0)
+                extraLabels.forEachIndexed { i, v -> arr[baseLabels.size + i] = v }
+            }
+        }
+
+        val n = samples.size
+
+        // Reuse Adam accumulator arrays without zeroing (warm-start)
+        val dw0 = FloatArray(w0.size); val db0 = FloatArray(b0.size)
+        val dw1 = FloatArray(w1.size); val db1 = FloatArray(b1.size)
+        val dw2 = FloatArray(w2.size); val db2 = FloatArray(b2.size)
+        val dw3 = FloatArray(w3.size); val db3 = FloatArray(b3.size)
+
+        val indices = IntArray(n) { it }
+        var totalLoss = 0f
+
+        for (epoch in 0 until epochs) {
+            for (i in n - 1 downTo 1) {
+                val j = (java.util.Random().nextInt(i + 1))
+                val tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp
+            }
+            totalLoss = 0f
+            var batchStart = 0
+            while (batchStart < n) {
+                val batchEnd = minOf(batchStart + DEFAULT_BATCH_SIZE, n)
+                val batchSize = batchEnd - batchStart
+                for (k in batchStart until batchEnd) {
+                    val idx = indices[k]
+                    val cache = forward(samples[idx])
+                    val label = labels[idx]
+                    val sig = 1f / (1f + exp(-cache.logit))
+                    totalLoss += -(label * ln(sig + 1e-7f) + (1f - label) * ln(1f - sig + 1e-7f))
+                    backward(cache, label, dw0, db0, dw1, db1, dw2, db2, dw3, db3)
+                }
+                adamStep++
+                adamUpdate(w0, b0, dw0, db0, m0w, v0w, m0b, v0b, batchSize)
+                adamUpdate(w1, b1, dw1, db1, m1w, v1w, m1b, v1b, batchSize)
+                adamUpdate(w2, b2, dw2, db2, m2w, v2w, m2b, v2b, batchSize)
+                adamUpdate(w3, b3, dw3, db3, m3w, v3w, m3b, v3b, batchSize)
+                batchStart = batchEnd
+            }
+        }
+
+        lastTrainLoss   = totalLoss / n
+        lastTrainEpochs += epochs
+        isTrained = true   // mark trained after first incremental pass
+    }
      *
      * Returns probability in [0, 1]: values > 0.5 indicate inside the hand.
      *

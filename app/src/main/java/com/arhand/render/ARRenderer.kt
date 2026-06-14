@@ -99,6 +99,26 @@ class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer 
         }
 
     /**
+     * Gap 4 — Forward body retarget result to [SkinnedMeshRenderer] to drive body joints.
+     * Call each frame when body tracking is active.
+     */
+    fun updateBodyPose(
+        bodyResult: com.arhand.mocap.BodyRetargetResult?,
+        asset:      com.arhand.mocap.LoadedAsset?
+    ) {
+        skinnedMeshRenderer.updateBodyPose(bodyResult, asset)
+    }
+
+    /**
+     * FACE-1 — Forward morph weight applications from [VrmBlendShapeParser] to
+     * [SkinnedMeshRenderer]. Called each frame when face tracking is active and
+     * a VRM asset with a blend shape map is loaded.
+     */
+    fun applyMorphWeights(applications: List<com.arhand.mocap.MorphApplication>) {
+        skinnedMeshRenderer.applyMorphWeights(applications)
+    }
+
+    /**
      * B6 — Last GL texture name allocated for ARCore. Stored so that depth sessions
      * created after surface initialisation (user enables depth mid-session) can still
      * receive [setCameraTextureName] immediately on [toggleDepth].
@@ -125,7 +145,7 @@ class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer 
     var onDepthFrameTick: (() -> Unit)? = null
 
     private val handRenderers        = arrayOf(HandRenderer(), HandRenderer())
-    private val pointCloudRenderer   = PointCloudRenderer()
+    private val depthCloudRenderer   = DepthCloudRenderer()   // stride-4 point tuples (x,y,z,conf)
     private val depthMeshRenderer    = DepthMeshRenderer()
     private val cameraPassthrough    = CameraPassthroughRenderer()
     private val skinnedMeshRenderer  = SkinnedMeshRenderer()
@@ -153,8 +173,8 @@ class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer 
         depthMeshRenderer.init()
         skinnedMeshRenderer.init()
         liveMeshRenderer.init()
+        depthCloudRenderer.init()
 
-        // B6 — Allocate an OES texture name for ARCore's camera feed and notify the
         // ViewModel so ArDepthSession.setCameraTextureName() can be called.
         // This must happen on the GL thread after a valid EGL context exists.
         val texIds = IntArray(1)
@@ -175,7 +195,6 @@ class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer 
     override fun onDrawFrame(gl: GL10?) {
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
 
-        // B6 — Tick the ARCore depth session once per frame on the GL thread.
         // Session.update() must be called here; it is a no-op when depth mode is off.
         onDepthFrameTick?.invoke()
 
@@ -206,8 +225,10 @@ class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer 
         }
 
         if (cmd.showCloud) {
-            cmd.scanCloudPoints?.let { pointCloudRenderer.update(it) }
-            pointCloudRenderer.draw(viewMatrix, projMatrix)
+            cmd.scanCloudPoints?.let {
+
+                depthCloudRenderer.updateAndDraw(it, viewMatrix, projMatrix)
+            }
         }
 
         cmd.depthMeshPositions?.let {
@@ -215,7 +236,6 @@ class ARRenderer(private val perfMonitor: PerfMonitor) : GLSurfaceView.Renderer 
             depthMeshRenderer.draw(viewMatrix, projMatrix, cmd.renderMode)
         }
 
-        // G1 — Draw the live-deforming scanned hand mesh when active
         if (cmd.liveMeshPositions != null) {
             liveMeshRenderer.draw(viewMatrix, projMatrix, cmd.torchOn, timeSec)
         }

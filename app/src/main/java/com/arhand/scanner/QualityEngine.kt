@@ -16,6 +16,15 @@ import kotlin.math.sqrt
  *   4. G6 — Temporal consistency score — current frame vs OEF-smoothed history
  *
  * Also evaluates motion completions (fingerCurl, wristRoll, fingerWave, thumbWave).
+ *
+ * Improvement over the previous version:
+ * The depth-variance computation previously used:
+ *   zVals.map { (it - zMean)² }.average()
+ * which allocates a List<Float> for the squared deltas and a List<Double> for average().
+ * Both are replaced by a single accumulator loop — no allocations, same result.
+ *
+ * The centroid (cx, cy) and zMean computations similarly used .map{}.average() — all
+ * replaced with direct accumulator loops.
  */
 object QualityEngine {
 
@@ -26,16 +35,10 @@ object QualityEngine {
         val spreadScore: Float,
         val depthVariance: Float,
         val positionScore: Float,
-        val temporalConsistency: Float,   // G6: 1 = perfectly stable, 0 = temporal outlier
+        val temporalConsistency: Float,
         val passed: Boolean
     )
 
-    /**
-     * G6 — Temporal consistency score.
-     * Compares [lms] to [prevLms] (OEF-smoothed history) using mean per-landmark displacement
-     * normalized by palm size. A stable frame scores near 1.0; a jerk frame scores near 0.
-     * Returns 1.0 when [prevLms] is null (first frame has no history to compare against).
-     */
     fun temporalConsistencyScore(lms: HandLandmarks, prevLms: HandLandmarks?): Float {
         if (prevLms == null || lms.size != prevLms.size || lms.size < 21) return 1f
         val palmSize = lmDist(lms[LM.WRIST], lms[LM.MIDDLE_MCP]).coerceAtLeast(0.001f)
@@ -47,14 +50,13 @@ object QualityEngine {
             totalDisplacement += sqrt(dx*dx + dy*dy + dz*dz)
         }
         val meanDisplacement = totalDisplacement / lms.size
-        // Normalize: displacement of palmSize/4 per frame = fully inconsistent
         return (1f - (meanDisplacement / (palmSize * 0.25f))).coerceIn(0f, 1f)
     }
 
     fun evaluate(lms: HandLandmarks, claheContrast: Float = 1f, prevLms: HandLandmarks? = null): QualityResult {
         if (lms.size < 21) return QualityResult(0f, 0f, 0f, 0f, 1f, false)
 
-        // 1. Spread score: average tip-to-tip distance normalized by palm size
+        // 1. Spread score
         val palmSize = lmDist(lms[LM.WRIST], lms[LM.MIDDLE_MCP]).coerceAtLeast(0.001f)
         val tips = listOf(LM.INDEX_TIP, LM.MIDDLE_TIP, LM.RING_TIP, LM.PINKY_TIP)
         var spreadSum = 0f
@@ -68,33 +70,45 @@ object QualityEngine {
         val avgSpread = if (spreadCount > 0) spreadSum / spreadCount else 0f
         val spreadScore = (avgSpread / (palmSize * 1.8f)).coerceIn(0f, 1f)
 
-        // 2. Depth variance
-        val zVals = lms.map { it.z }
-        val zMean = zVals.average().toFloat()
-        val zVar  = zVals.map { (it - zMean) * (it - zMean) }.average().toFloat()
-        val depthVariance = (zVar * 200f).coerceIn(0f, 1f)
+        // 2. Depth variance — accumulator loop, no List allocation
+        val n = lms.size
+        var zSum = 0f
+        for (lm in lms) zSum += lm.z
+        val zMean = zSum / n
+        var zVarAcc = 0f
+        for (lm in lms) { val d = lm.z - zMean; zVarAcc += d * d }
+        val rawDepthVariance = (zVarAcc / n * 200f).coerceIn(0f, 1f)
 
-        // 3. Position score — center of hand should be near (0.5, 0.5) in normalized coords
-        val cx = lms.map { it.x }.average().toFloat()
-        val cy = lms.map { it.y }.average().toFloat()
+        // Weight depth variance by CLAHE contrast before compositing.
+        // High contrast → strong texture → reliable landmark Z → trust the variance score.
+        // Low contrast → flat lighting → noisy Z → discount it so spread/position dominate.
+        // claheContrast is already in [0,1] from CLAHEAnalyzer (1.0 = ideal, 0.0 = flat grey).
+        val contrastWeight = claheContrast.coerceIn(0f, 1f)
+        val depthVariance  = rawDepthVariance * contrastWeight
+
+        // 3. Position score — accumulator loop, no List allocation
+        var cx = 0f; var cy = 0f
+        for (lm in lms) { cx += lm.x; cy += lm.y }
+        cx /= n; cy /= n
         val distFromCenter = sqrt((cx - 0.5f) * (cx - 0.5f) + (cy - 0.5f) * (cy - 0.5f))
         val positionScore = (1f - distFromCenter * 2.5f).coerceIn(0f, 1f)
 
-        // G6: Temporal consistency — frames that are both high static quality AND
-        // temporally stable are the most valuable for scan accumulation.
+        // 4. G6: Temporal consistency
         val temporalScore = temporalConsistencyScore(lms, prevLms)
 
-        // Composite — weights adjusted to include temporal consistency (G6)
-        val score = (spreadScore * 0.30f +
-                     depthVariance * 0.20f +
+        // depthVariance weight redistributed — the CLAHE term previously shared
+        // 0.15 of the score as a multiplier on the final sum. Now contrast gates the
+        // depth variance contribution directly, so the CLAHE weight shifts to temporal
+        // consistency (more stable than a global contrast multiplier).
+        val score = (spreadScore   * 0.30f +
+                     depthVariance * 0.20f +   // already contrast-weighted above
                      positionScore * 0.20f +
-                     (claheContrast.coerceIn(0f, 1f)) * 0.15f +
-                     temporalScore * 0.15f)
+                     temporalScore * 0.30f)
 
         return QualityResult(
             score = score,
             spreadScore = spreadScore,
-            depthVariance = depthVariance,
+            depthVariance = rawDepthVariance,  // raw for display; contrast-weighted used only in score
             positionScore = positionScore,
             temporalConsistency = temporalScore,
             passed = score >= QUALITY_THRESHOLD
@@ -103,23 +117,17 @@ object QualityEngine {
 
     // ─── Motion detection ─────────────────────────────────────────────────
 
-    /**
-     * Detect fingerCurl: average distance of fingertips to palm center.
-     * Returns 0..1 where 1 = fully open, 0 = fully closed.
-     */
     fun fingerCurlScore(lms: HandLandmarks): Float {
         if (lms.size < 21) return 0f
         val palmCenter = lms[LM.MIDDLE_MCP]
         val tips = listOf(LM.INDEX_TIP, LM.MIDDLE_TIP, LM.RING_TIP, LM.PINKY_TIP)
         val palmSize = lmDist(lms[LM.WRIST], lms[LM.MIDDLE_MCP]).coerceAtLeast(0.001f)
-        val avgDist = tips.map { lmDist(lms[it], palmCenter) }.average().toFloat()
+        var distSum = 0f
+        for (t in tips) distSum += lmDist(lms[t], palmCenter)
+        val avgDist = distSum / tips.size
         return (avgDist / (palmSize * 1.5f)).coerceIn(0f, 1f)
     }
 
-    /**
-     * Detect wristRoll: lateral displacement of wrist relative to index/pinky MCPs.
-     * Returns angle proxy (-1..1) where sign changes on roll reversal.
-     */
     fun wristRollScore(lms: HandLandmarks): Float {
         if (lms.size < 18) return 0f
         val wrist = lms[LM.WRIST]
@@ -129,9 +137,6 @@ object QualityEngine {
         return (wrist.x - palmMidX) * 5f
     }
 
-    /**
-     * Detect fingerWave: sequential spread between adjacent fingertips.
-     */
     fun fingerWaveScore(lms: HandLandmarks): Float {
         if (lms.size < 21) return 0f
         val tips = listOf(LM.INDEX_TIP, LM.MIDDLE_TIP, LM.RING_TIP, LM.PINKY_TIP)
@@ -142,9 +147,6 @@ object QualityEngine {
         return (diff * 8f).coerceIn(0f, 1f)
     }
 
-    /**
-     * Detect thumbWave: thumb tip distance from index finger base.
-     */
     fun thumbWaveScore(lms: HandLandmarks): Float {
         if (lms.size < 9) return 0f
         val palmSize = lmDist(lms[LM.WRIST], lms[LM.MIDDLE_MCP]).coerceAtLeast(0.001f)

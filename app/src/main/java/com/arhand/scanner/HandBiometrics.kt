@@ -48,16 +48,25 @@ data class HandBiometrics(
 ) {
     companion object {
         /**
-         * Approximate world-unit → mm scale factor.
+         * World-unit → mm scale factor.
          *
-         * Derived from the VIEW_SCALE = 0.65 and typical MediaPipe depth range.
-         * A palm width of ~0.10 world units ≈ 80 mm for an average adult hand.
-         * This gives a factor of ~800.
+         * [landmarkToWorld] uses MediaPipe's metric world landmarks (worldX/Y/Z) when
+         * they are non-zero, which is always the case with the Tasks SDK. Those coordinates
+         * are in metres (hand-geometric-centre origin). Converting metres → mm = × 1000.
          *
-         * For high-accuracy use, expose a calibration flow where the user places their
-         * hand against a known-size reference (e.g. a credit card, 85.6×54mm).
+         * The legacy value 800f was calibrated for the screen-space fallback path
+         * (VIEW_SCALE = 0.65 normalised coords ≈ 0.10 world units per ~80mm palm),
+         * which is only taken when worldX == 0 AND worldY == 0 — this does not occur
+         * in practice with the Tasks SDK populating world landmarks.
+         *
+         * Anatomy check: INDEX_MCP→PINKY_MCP in MediaPipe world coords ≈ 0.078–0.090m.
+         *   toMm(0.084) = 84mm — matches Garrett 1971 male average (84mm). ✓
+         * Previous value: toMm(0.084) = 67mm — 20% low, ring size ~2 sizes too small. ✗
+         *
+         * For further accuracy, the D2 calibration flow lets the user hold a credit card
+         * (85.6×54mm) to derive a device-specific override stored in PersonalModelStore.
          */
-        const val WORLD_TO_MM = 800f
+        const val WORLD_TO_MM = 1000f
 
         /**
          * Compute biometrics from the best-quality landmarks accumulated during a scan.
@@ -72,7 +81,6 @@ data class HandBiometrics(
         ): HandBiometrics? {
             if (frames.isEmpty()) return null
 
-            // D1 — Multi-frame biometric averaging with outlier rejection.
             // A single frame has ±8–12% error due to MediaPipe's Z proxy.
             // Strategy: take the top-10 frames by quality score, compute each metric
             // per frame, then discard outliers beyond 1.5×IQR and return the trimmed mean.

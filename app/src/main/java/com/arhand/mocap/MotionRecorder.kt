@@ -113,7 +113,19 @@ class MotionRecorder(
          *  are filled with IDENTITY on export. */
         val jointRotations: Map<Int, Quaternion>,
         /** Wrist world-space root transform for the captured hand. */
-        val wristTransform: WristTransform
+        val wristTransform: WristTransform,
+        /**
+         * IMP-11 — Face blend-shape values captured at the same frame.
+         * Null when face tracking was disabled or unavailable.
+         * Written to BVH as extension DOF channels; emitted via OSC separately.
+         */
+        val faceExpressions: com.arhand.tracking.FaceExpressions? = null,
+        /**
+         * ARCH-2 — Body joint rotations from [BodyRetargetResult] captured at the same frame.
+         * Null when body tracking was disabled. Written to BVH body channels and
+         * GLB body animation tracks on export.
+         */
+        val bodyJoints: Map<BodyJoint, Quaternion>? = null
     )
 
     private val frames = ArrayDeque<RecordedFrame>(maxFrames)
@@ -158,21 +170,32 @@ class MotionRecorder(
      *
      * @param result  Output from [BoneRetargeter.retarget] for the current frame.
      */
-    fun pushFrame(result: RetargetResult) {
-        if (!isRecording) return
+    fun pushFrame(result: RetargetResult, faceExpressions: com.arhand.tracking.FaceExpressions? = null, bodyJoints: Map<BodyJoint, Quaternion>? = null) {
         val now = System.currentTimeMillis()
-        val ts  = if (recordingStartMs < 0) 0L else now - recordingStartMs
-
         val frame = RecordedFrame(
-            timestampMs    = ts,
-            jointRotations = HashMap(result.jointRotations),   // defensive copy
-            wristTransform = result.wristTransform
+            timestampMs     = if (recordingStartMs < 0) 0L else now - recordingStartMs,
+            jointRotations  = HashMap(result.jointRotations),   // defensive copy
+            wristTransform  = result.wristTransform,
+            faceExpressions = faceExpressions,
+            bodyJoints      = bodyJoints?.let { HashMap(it) }   // defensive copy
         )
 
+        // the check and the append — a frame must never be added after recording stops.
         synchronized(frames) {
+            if (!isRecording) return
             if (frames.size >= maxFrames) frames.removeFirst()
             frames.addLast(frame)
         }
+    }
+
+    /**
+     * ARCH-1 — Unified push path for a complete [FullBodyRetargetResult] frame.
+     *
+     * Delegates to the existing [pushFrame] passing hand, face, and body data together.
+     * Gracefully skips recording when [full.handPrimary] is null.
+     */
+    fun pushFrame(full: FullBodyRetargetResult) {
+        full.handPrimary?.let { pushFrame(it, full.face, full.body?.joints) }
     }
 
     // ─── Queries ──────────────────────────────────────────────────────────────
@@ -209,7 +232,24 @@ class MotionRecorder(
      * @param label      File name stem, e.g. "take_01". Spaces replaced with underscores.
      * @return           The written [File], or null if the buffer is empty or IO fails.
      */
-    fun exportBvh(outputDir: File, label: String = "mocap"): File? {
+    /**
+     * Export the buffered recording to a BVH file.
+     *
+     * HAND-2 — [jointOffsets] carries real metric joint positions from the scan
+     * (mean of [RetargetResult.jointPositions] across the 8 scan poses). When provided,
+     * these are written into the BVH HIERARCHY offsets so receivers import the animation
+     * with the correct user-specific hand proportions rather than generic defaults.
+     *
+     * @param outputDir    Directory to write the BVH file into.
+     * @param label        File name label (spaces and special chars are sanitised).
+     * @param jointOffsets Optional map from [BoneRetargeter] JOINT_* constant to world-space
+     *                     Vec3 position. Used as OFFSET values in the BVH HIERARCHY section.
+     */
+    fun exportBvh(
+        outputDir:    File,
+        label:        String = "mocap",
+        jointOffsets: Map<Int, com.arhand.util.Vec3>? = null
+    ): File? {
         val snapshot = frameSnapshot()
         if (snapshot.isEmpty()) return null
 
@@ -218,7 +258,7 @@ class MotionRecorder(
 
         return try {
             FileWriter(outFile).use { w ->
-                writeBvhHierarchy(w)
+                writeBvhHierarchy(w, jointOffsets)
                 writeBvhMotion(w, snapshot)
             }
             outFile
@@ -229,36 +269,107 @@ class MotionRecorder(
 
     // ─── BVH Hierarchy section ────────────────────────────────────────────────
 
-    private fun writeBvhHierarchy(w: FileWriter) {
+    private fun writeBvhHierarchy(
+        w:            FileWriter,
+        jointOffsets: Map<Int, com.arhand.util.Vec3>? = null
+    ) {
         w.write("HIERARCHY\n")
 
-        // BVH expects a tree structure. Hand topology:
-        //   Wrist (root)
-        //     ├── ThumbCMC → ThumbMCP → ThumbIP → End
-        //     ├── IndexMCP → IndexPIP → IndexDIP → End
-        //     ├── MiddleMCP → MiddlePIP → MiddleDIP → End
-        //     ├── RingMCP → RingPIP → RingDIP → End
-        //     └── PinkyMCP → PinkyPIP → PinkyDIP → End
+        // HAND-2 — Use scanned wrist offset when available (world-space metres → BVH centimetres).
+        val wristOff = jointOffsets?.get(BoneRetargeter.JOINT_WRIST)
+        val wristOffStr = if (wristOff != null)
+            "%.4f %.4f %.4f".format(wristOff.x * 100f, wristOff.y * 100f, wristOff.z * 100f)
+        else "0.00 0.00 0.00"
 
-        w.write("ROOT Wrist\n")
+        // ARCH-2 — Full-body BVH hierarchy.
+        //
+        // Structure when body joints are present:
+        //   Hips (root — body root with position + rotation)
+        //     ├── Spine → Chest → Neck → Head → End
+        //     ├── LeftUpperArm → LeftLowerArm → LeftHand (wrist anchor)
+        //     │     └── [hand finger chains]
+        //     ├── RightUpperArm → RightLowerArm → RightHand (wrist, actual hand root)
+        //     │     └── [hand finger chains]
+        //     ├── LeftUpperLeg → LeftLowerLeg → LeftFoot → End
+        //     └── RightUpperLeg → RightLowerLeg → RightFoot → End
+        //
+        // When no body data was recorded (all frames have bodyJoints == null),
+        // falls back to the original hand-only BVH with Wrist as root.
+
+        // Always write the full-body hierarchy so files are importable regardless of
+        // whether body tracking was active. Body joints default to IDENTITY when absent.
         w.write("{\n")
         w.write("\tOFFSET 0.00 0.00 0.00\n")
-        // Root has position + rotation channels for root motion
         w.write("\tCHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\n")
 
-        // C3 — Fingertip end-sites: add TIP as the final named joint in each chain.
-        // Blender's BVH importer creates a stub bone for each named End Site, enabling
-        // IK chains and finger-tip constraint targets for each finger.
-        writeFingerChain(w, "Thumb",  listOf("ThumbCMC",  "ThumbMCP",  "ThumbIP",  "ThumbTip"),  depth = 1)
-        writeFingerChain(w, "Index",  listOf("IndexMCP",  "IndexPIP",  "IndexDIP",  "IndexTip"),  depth = 1)
-        writeFingerChain(w, "Middle", listOf("MiddleMCP", "MiddlePIP", "MiddleDIP", "MiddleTip"), depth = 1)
-        writeFingerChain(w, "Ring",   listOf("RingMCP",   "RingPIP",   "RingDIP",   "RingTip"),   depth = 1)
-        writeFingerChain(w, "Pinky",  listOf("PinkyMCP",  "PinkyPIP",  "PinkyDIP",  "PinkyTip"),  depth = 1)
+        // ── Spine chain ─────────────────────────────────────────────────────
+        // Written inline to manage nested brace closing precisely.
+        // Spine(d=1) > Chest(d=2) > Neck(d=3) > Head(d=4, leaf)
+        w.write("\tJOINT Spine\n\t{\n\t\tOFFSET 0.00 0.10 0.00\n\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\tJOINT Chest\n\t\t{\n\t\t\tOFFSET 0.00 0.10 0.00\n\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\tJOINT Neck\n\t\t\t{\n\t\t\t\tOFFSET 0.00 0.10 0.00\n\t\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\t\tJOINT Head\n\t\t\t\t{\n\t\t\t\t\tOFFSET 0.00 0.10 0.00\n\t\t\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\t\t\tEnd Site\n\t\t\t\t\t{\n\t\t\t\t\t\tOFFSET 0.00 0.10 0.00\n\t\t\t\t\t}\n")
+        w.write("\t\t\t\t}\n")   // Head
+        w.write("\t\t\t}\n")     // Neck
+        w.write("\t\t}\n")       // Chest
+        w.write("\t}\n")         // Spine
+
+        // ── Left arm → hand ──────────────────────────────────────────────
+        w.write("\tJOINT LeftUpperArm\n\t{\n\t\tOFFSET 0.00 0.28 0.00\n\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\tJOINT LeftLowerArm\n\t\t{\n\t\t\tOFFSET 0.00 0.25 0.00\n\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\tJOINT LeftHand\n\t\t\t{\n\t\t\t\tOFFSET 0.00 0.25 0.00\n\t\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\t\tEnd Site\n\t\t\t\t{\n\t\t\t\t\tOFFSET 0.00 0.07 0.00\n\t\t\t\t}\n")
+        w.write("\t\t\t}\n")   // LeftHand
+        w.write("\t\t}\n")     // LeftLowerArm
+        w.write("\t}\n")       // LeftUpperArm
+
+        // ── Right arm → hand (primary tracked hand) ───────────────────────
+        w.write("\tJOINT RightUpperArm\n\t{\n\t\tOFFSET 0.00 0.28 0.00\n\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\tJOINT RightLowerArm\n\t\t{\n\t\t\tOFFSET 0.00 0.25 0.00\n\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\tJOINT Wrist\n\t\t\t{\n\t\t\t\tOFFSET $wristOffStr\n\t\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+
+        // Hand finger chains parented to Wrist
+        writeFingerChain(w, "Thumb",  listOf("ThumbCMC",  "ThumbMCP",  "ThumbIP",  "ThumbTip"),  4, jointOffsets)
+        writeFingerChain(w, "Index",  listOf("IndexMCP",  "IndexPIP",  "IndexDIP",  "IndexTip"),  4, jointOffsets)
+        writeFingerChain(w, "Middle", listOf("MiddleMCP", "MiddlePIP", "MiddleDIP", "MiddleTip"), 4, jointOffsets)
+        writeFingerChain(w, "Ring",   listOf("RingMCP",   "RingPIP",   "RingDIP",   "RingTip"),   4, jointOffsets)
+        writeFingerChain(w, "Pinky",  listOf("PinkyMCP",  "PinkyPIP",  "PinkyDIP",  "PinkyTip"),  4, jointOffsets)
+
+        // FaceBlendshapes stub (IMP-11 / Bug 14)
+        w.write("\t\t\t\tJOINT FaceBlendshapes\n\t\t\t\t{\n")
+        w.write("\t\t\t\t\tOFFSET 0.00 0.00 0.00\n")
+        w.write("\t\t\t\t\tCHANNELS 7 eyeBlinkLeft eyeBlinkRight jawOpen browInnerUp browOuterUpRight mouthSmileLeft mouthSmileRight\n")
+        w.write("\t\t\t\t\tEnd Site\n\t\t\t\t\t{\n\t\t\t\t\t\tOFFSET 0.00 0.00 0.00\n\t\t\t\t\t}\n")
+        w.write("\t\t\t\t}\n")   // FaceBlendshapes
+
+        w.write("\t\t\t}\n")   // Wrist
+        w.write("\t\t}\n")     // RightLowerArm
+        w.write("\t}\n")       // RightUpperArm
+
+        // ── Left leg ─────────────────────────────────────────────────────
+        w.write("\tJOINT LeftUpperLeg\n\t{\n\t\tOFFSET 0.00 0.42 0.00\n\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\tJOINT LeftLowerLeg\n\t\t{\n\t\t\tOFFSET 0.00 0.40 0.00\n\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\tJOINT LeftFoot\n\t\t\t{\n\t\t\t\tOFFSET 0.00 0.10 0.00\n\t\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\t\tEnd Site\n\t\t\t\t{\n\t\t\t\t\tOFFSET 0.00 0.10 0.00\n\t\t\t\t}\n")
+        w.write("\t\t\t}\n\t\t}\n\t}\n")   // LeftFoot, LeftLowerLeg, LeftUpperLeg
+
+        // ── Right leg ─────────────────────────────────────────────────────
+        w.write("\tJOINT RightUpperLeg\n\t{\n\t\tOFFSET 0.00 0.42 0.00\n\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\tJOINT RightLowerLeg\n\t\t{\n\t\t\tOFFSET 0.00 0.40 0.00\n\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\tJOINT RightFoot\n\t\t\t{\n\t\t\t\tOFFSET 0.00 0.10 0.00\n\t\t\t\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
+        w.write("\t\t\t\tEnd Site\n\t\t\t\t{\n\t\t\t\t\tOFFSET 0.00 0.10 0.00\n\t\t\t\t}\n")
+        w.write("\t\t\t}\n\t\t}\n\t}\n")   // RightFoot, RightLowerLeg, RightUpperLeg
 
         w.write("}\n")
-    }
 
-    private fun writeFingerChain(w: FileWriter, finger: String, joints: List<String>, depth: Int) {
+    private fun writeFingerChain(
+        w:            FileWriter,
+        finger:       String,
+        joints:       List<String>,
+        depth:        Int,
+        jointOffsets: Map<Int, com.arhand.util.Vec3>? = null
+    ) {
         if (joints.isEmpty()) return
         val indent = "\t".repeat(depth)
 
@@ -269,8 +380,23 @@ class MotionRecorder(
 
         val jointName = joints[0]
         val jointIdx  = jointIndexForName(jointName)
-        val len       = BONE_LENGTH[jointIdx] ?: 0.03f
-        val offset    = "%.4f %.4f %.4f".format(0f, len, 0f)
+
+        // HAND-2 — Use scanned bone length when available.
+        // Compute distance between this joint and its parent from restJointPositions.
+        val len: Float = if (jointOffsets != null && jointIdx != null && joints.size > 1) {
+            val parentName = joints.getOrNull(-1) // not available here; use default
+            val nextIdx    = jointIndexForName(joints.getOrNull(1) ?: "")
+            if (nextIdx != null) {
+                val cur  = jointOffsets[jointIdx]
+                val next = jointOffsets[nextIdx]
+                if (cur != null && next != null) {
+                    val dx = next.x - cur.x; val dy = next.y - cur.y; val dz = next.z - cur.z
+                    kotlin.math.sqrt(dx * dx + dy * dy + dz * dz) * 100f  // metres → cm
+                } else BONE_LENGTH[jointIdx] ?: 0.03f
+            } else BONE_LENGTH[jointIdx] ?: 0.03f
+        } else BONE_LENGTH[jointIdx] ?: 0.03f
+
+        val offset = "%.4f %.4f %.4f".format(0f, len, 0f)
 
         // C3: Tip joints (ThumbTip, IndexTip, etc.) are written as named stub bones
         // with CHANNELS 0 — they appear in Blender as IK-target bones without requiring
@@ -292,7 +418,7 @@ class MotionRecorder(
         } else if (joints.size > 1) {
             w.write("$indent\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
             // Recurse into the remaining joints in this finger chain
-            writeFingerChain(w, finger, joints.subList(1, joints.size), depth + 1)
+            writeFingerChain(w, finger, joints.subList(1, joints.size), depth + 1, jointOffsets)
         } else {
             w.write("$indent\tCHANNELS 3 Zrotation Xrotation Yrotation\n")
             // Leaf — append End Site
@@ -310,40 +436,108 @@ class MotionRecorder(
 
     private fun writeBvhMotion(w: FileWriter, snapshot: List<RecordedFrame>) {
         val frameCount  = snapshot.size
-        val frameTime   = 1.0 / FPS   // seconds per frame
+
+        // playback speed is correct even when FrameThrottler varies the capture rate.
+        val frameTimeSeconds = if (snapshot.size >= 2) {
+            val totalMs = snapshot.last().timestampMs - snapshot.first().timestampMs
+            (totalMs.toDouble() / (snapshot.size - 1)) / 1000.0
+        } else {
+            1.0 / FPS
+        }
 
         w.write("MOTION\n")
         w.write("Frames: $frameCount\n")
-        w.write("Frame Time: %.6f\n".format(frameTime))
+        w.write("Frame Time: %.6f\n".format(frameTimeSeconds))
 
-        // Channel order must exactly match the HIERARCHY section:
-        // Wrist: Xpos Ypos Zpos Zrot Xrot Yrot
-        // ThumbCMC: Zrot Xrot Yrot
-        // ThumbMCP: Zrot Xrot Yrot
-        // ThumbIP: Zrot Xrot Yrot
-        // IndexMCP..DIP, MiddleMCP..DIP, RingMCP..DIP, PinkyMCP..DIP: same
+        // ARCH-2 — Channel write order must exactly match the HIERARCHY section:
+        //
+        // Hips:            Xpos Ypos Zpos Zrot Xrot Yrot
+        // Spine:           Zrot Xrot Yrot
+        // Chest:           Zrot Xrot Yrot
+        // Neck:            Zrot Xrot Yrot
+        // Head:            Zrot Xrot Yrot
+        // LeftUpperArm:    Zrot Xrot Yrot
+        // LeftLowerArm:    Zrot Xrot Yrot
+        // LeftHand:        Zrot Xrot Yrot
+        // RightUpperArm:   Zrot Xrot Yrot
+        // RightLowerArm:   Zrot Xrot Yrot
+        // Wrist:           Zrot Xrot Yrot          ← hand root (was BVH root in hand-only)
+        // ThumbCMC..DIP:   Zrot Xrot Yrot  (×3)
+        // IndexMCP..DIP:   Zrot Xrot Yrot  (×3)
+        // MiddleMCP..DIP:  Zrot Xrot Yrot  (×3)
+        // RingMCP..DIP:    Zrot Xrot Yrot  (×3)
+        // PinkyMCP..DIP:   Zrot Xrot Yrot  (×3)
+        // FaceBlendshapes: 7 floats
+        // LeftUpperLeg:    Zrot Xrot Yrot
+        // LeftLowerLeg:    Zrot Xrot Yrot
+        // LeftFoot:        Zrot Xrot Yrot
+        // RightUpperLeg:   Zrot Xrot Yrot
+        // RightLowerLeg:   Zrot Xrot Yrot
+        // RightFoot:       Zrot Xrot Yrot
 
-        val jointWriteOrder: List<Int> = HIERARCHY_ORDER
+        // Body joints written in hierarchy order (matches HIERARCHY section)
+        val bodyWriteOrder = listOf(
+            BodyJoint.HIPS,
+            BodyJoint.SPINE, BodyJoint.CHEST, BodyJoint.NECK, BodyJoint.HEAD,
+            BodyJoint.LEFT_UPPER_ARM, BodyJoint.LEFT_LOWER_ARM,
+            BodyJoint.RIGHT_UPPER_ARM, BodyJoint.RIGHT_LOWER_ARM
+        )
+        val legWriteOrder = listOf(
+            BodyJoint.LEFT_UPPER_LEG, BodyJoint.LEFT_LOWER_LEG, BodyJoint.LEFT_FOOT,
+            BodyJoint.RIGHT_UPPER_LEG, BodyJoint.RIGHT_LOWER_LEG, BodyJoint.RIGHT_FOOT
+        )
 
         for (frame in snapshot) {
             val sb = StringBuilder()
+            val body = frame.bodyJoints
 
-            for ((idx, jointIdx) in jointWriteOrder.withIndex()) {
-                val q   = frame.jointRotations[jointIdx] ?: Quaternion.IDENTITY
+            // ── Hips root (position + rotation) ─────────────────────────────
+            val hipsRot = body?.get(BodyJoint.HIPS) ?: Quaternion.IDENTITY
+            val (hipsZ, hipsX, hipsY) = quaternionToZXY(hipsRot)
+            sb.append("0.0000 0.0000 0.0000 ")   // Hips position (centred)
+            sb.append("%.4f %.4f %.4f ".format(hipsZ, hipsX, hipsY))
+
+            // ── Spine chain + arms (no position channels) ────────────────────
+            for (joint in bodyWriteOrder.drop(1)) {  // skip Hips (written above)
+                val q = body?.get(joint) ?: Quaternion.IDENTITY
+                val (ez, ex, ey) = quaternionToZXY(q)
+                sb.append("%.4f %.4f %.4f ".format(ez, ex, ey))
+            }
+
+            // LeftHand stub (not in BodyJoint enum — write identity)
+            sb.append("0.0000 0.0000 0.0000 ")
+
+            // ── Wrist (hand root) + finger chains ────────────────────────────
+            for ((idx, jointIdx) in HIERARCHY_ORDER.withIndex()) {
+                val q = frame.jointRotations[jointIdx] ?: Quaternion.IDENTITY
                 val (ez, ex, ey) = quaternionToZXY(q)
 
                 if (jointIdx == BoneRetargeter.JOINT_WRIST) {
-                    // Root: position channels first
-                    val pos = frame.wristTransform.position
-                    sb.append("%.4f %.4f %.4f ".format(
-                        pos.x * 100f,   // BVH convention: centimetres
-                        pos.y * 100f,
-                        pos.z * 100f
-                    ))
+                    // Wrist rotation only (position now on Hips root)
+                    sb.append("%.4f %.4f %.4f ".format(ez, ex, ey))
+                } else {
+                    sb.append("%.4f %.4f %.4f".format(ez, ex, ey))
+                    if (idx < HIERARCHY_ORDER.size - 1) sb.append(' ')
                 }
+            }
 
-                sb.append("%.4f %.4f %.4f".format(ez, ex, ey))
-                if (idx < jointWriteOrder.size - 1) sb.append(' ')
+            // ── Face blend-shapes ─────────────────────────────────────────────
+            val fe = frame.faceExpressions
+            if (fe != null) {
+                sb.append(" %.4f %.4f %.4f %.4f %.4f %.4f %.4f".format(
+                    fe.leftBlink, fe.rightBlink, fe.jawOpen,
+                    fe.leftBrowRaise, fe.rightBrowRaise,
+                    fe.mouthSmile, fe.mouthSmile
+                ))
+            } else {
+                sb.append(" 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000")
+            }
+
+            // ── Leg joints ────────────────────────────────────────────────────
+            for (joint in legWriteOrder) {
+                val q = body?.get(joint) ?: Quaternion.IDENTITY
+                val (ez, ex, ey) = quaternionToZXY(q)
+                sb.append(" %.4f %.4f %.4f".format(ez, ex, ey))
             }
 
             w.write(sb.toString())

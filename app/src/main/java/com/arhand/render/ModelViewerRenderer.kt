@@ -16,13 +16,27 @@ import kotlin.math.sin
  *   - radius driven by pinch span delta
  *   - always looks at the world origin
  *
- * The mesh is the same FloatArray of triangle positions produced by DepthCarver/MarchingCubes
- * — no re-processing needed.
+ * ARCH-3 — When [retargetResult] is non-null and a [loadedAsset] with a skin is set,
+ * the viewer drives the asset's bone matrices from the live retarget result, making
+ * it a live mirror of the tracked performance rather than a static post-scan display.
  */
 class ModelViewerRenderer : GLSurfaceView.Renderer {
 
     /** Set from AppViewModel after scan completes. Thread-safe (volatile). */
     @Volatile var meshPositions: FloatArray = FloatArray(0)
+
+    /**
+     * ARCH-3 — Live retarget result from the tracking pipeline.
+     * When non-null and [loadedAsset] has a skin, the bone palette is updated
+     * from this result each frame, animating the loaded character in real time.
+     */
+    @Volatile var retargetResult: com.arhand.mocap.RetargetResult? = null
+
+    /**
+     * ARCH-3 — Loaded skinned asset. When non-null, [SkinnedMeshRenderer] drives it
+     * from [retargetResult]. Falls back to raw mesh rendering when null.
+     */
+    @Volatile var loadedAsset: com.arhand.mocap.LoadedAsset? = null
 
     // ── Camera state (mutated from the UI thread via touch handlers) ──────────
     @Volatile var azimuthDeg:   Float = 30f
@@ -35,6 +49,10 @@ class ModelViewerRenderer : GLSurfaceView.Renderer {
     private var vertexCount   = 0
     private var geometryDirty = false
     private var lastMeshRef: FloatArray? = null
+
+    // ARCH-3 — Skinned mesh renderer for the loaded asset (character animation)
+    private val skinnedRenderer = SkinnedMeshRenderer()
+    private var lastAssetRef: com.arhand.mocap.LoadedAsset? = null
 
     private val projMatrix = FloatArray(16)
     private val viewMatrix = FloatArray(16)
@@ -50,6 +68,7 @@ class ModelViewerRenderer : GLSurfaceView.Renderer {
 
         phongProgram = buildProg(ShaderPrograms.PHONG_VERT, ShaderPrograms.PHONG_FRAG)
         GLES30.glGenBuffers(1, vboHandle, 0)
+        skinnedRenderer.init()   // ARCH-3
 
         Matrix.setLookAtM(viewMatrix, 0,
             0f, 0f, orbitRadius,
@@ -66,19 +85,32 @@ class ModelViewerRenderer : GLSurfaceView.Renderer {
 
     override fun onDrawFrame(gl: GL10?) {
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
+        buildViewMatrix()
 
+        val asset  = loadedAsset
+        val result = retargetResult
+
+        // ARCH-3 — If a skinned asset and live retarget result are both present,
+        // drive the character skeleton and render via SkinnedMeshRenderer.
+        if (asset != null && asset.hasSkin && result != null) {
+            // Sync asset to skinned renderer on change
+            if (asset !== lastAssetRef) {
+                skinnedRenderer.updateAsset(asset)
+                lastAssetRef = asset
+            }
+            skinnedRenderer.updatePose(result)
+
+            val timeSec = (System.nanoTime() / 1_000_000_000.0).toFloat()
+            skinnedRenderer.draw(viewMatrix, projMatrix, torchOn = false, timeSec = timeSec)
+            return
+        }
+
+        // Fallback: render raw scan mesh (static, no skeleton)
         val positions = meshPositions
         if (positions.isEmpty()) return
 
-        // Detect geometry change
         if (positions !== lastMeshRef) { lastMeshRef = positions; geometryDirty = true }
-
-        if (geometryDirty) {
-            uploadGeometry(positions)
-            geometryDirty = false
-        }
-
-        buildViewMatrix()
+        if (geometryDirty) { uploadGeometry(positions); geometryDirty = false }
 
         val model = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
         GLES30.glUseProgram(phongProgram)
@@ -136,6 +168,7 @@ class ModelViewerRenderer : GLSurfaceView.Renderer {
     fun release() {
         if (vboHandle[0] != 0) { GLES30.glDeleteBuffers(1, vboHandle, 0); vboHandle[0] = 0 }
         if (phongProgram != 0) { GLES30.glDeleteProgram(phongProgram);     phongProgram = 0 }
+        skinnedRenderer.release()   // ARCH-3
     }
 
     private fun buildProg(v: String, f: String): Int {

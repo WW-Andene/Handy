@@ -13,6 +13,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arhand.util.PerfState
+import com.arhand.util.ModelBudgetManager
 import com.arhand.tracking.Gesture
 
 /**
@@ -32,7 +33,12 @@ fun HudOverlay(
     torchOn: Boolean,
     landmarkCount: Int = 0,
     activeSlots: String = "--",
-    activeGesture: Gesture? = null
+    activeGesture: Gesture? = null,
+    handSide: com.arhand.tracking.HandSide = com.arhand.tracking.HandSide.UNKNOWN,
+    /** Gap 3 — OSC health for connection status indicator. */
+    oscHealth: com.arhand.mocap.OscHealthState = com.arhand.mocap.OscHealthState(),
+    /** Spatial layer state — always-on depth sensing status. */
+    spatialState: com.arhand.depth.SpatialLayer.SpatialState = com.arhand.depth.SpatialLayer.SpatialState()
 ) {
     // E4: Long-press cycles MINIMAL → VERBOSE → MINIMAL
     var hudMode by remember { mutableStateOf(HudMode.VERBOSE) }
@@ -56,6 +62,36 @@ fun HudOverlay(
                 HudLabel("FPS",  "%.0f".format(perf.fps),  if (perf.fps < 30f) Warn else Plasma)
                 HudLabel("INF",  "%.1fms".format(perf.inferenceMs), Plasma)
                 HudLabel("SKIP", "%.0f%%".format(perf.skipRatio * 100f), Plasma)
+
+                // Spatial layer status — always shown, colour-coded by grounding state
+                val spatialColor = when {
+                    spatialState.isGrounded  -> Color(0xFF00E676)   // ARCore tracking = metric
+                    spatialState.depthActive -> Color(0xFFFFAB00)   // SfM only = relative
+                    else                     -> Color.White.copy(0.3f)
+                }
+                val spatialLabel = when {
+                    spatialState.isGrounded  -> "MTR %.0f%%".format(spatialState.depthConfidence * 100f)
+                    spatialState.depthActive -> "SFM"
+                    else                     -> "OFF"
+                }
+                HudLabel("DEPTH", spatialLabel, spatialColor)
+
+                // Gap 3 — OSC health indicator (shown whenever streaming has been active)
+                if (oscHealth.sentFrames > 0 || oscHealth.isHealthy) {
+                    val oscColor = when {
+                        !oscHealth.isHealthy              -> Warn
+                        oscHealth.dropRate > 0.05f        -> Warn
+                        oscHealth.frameRateFps >= 25f     -> Color(0xFF00E676)
+                        else                              -> Plasma
+                    }
+                    val oscLabel = if (oscHealth.isHealthy)
+                        "%.0ffps".format(oscHealth.frameRateFps)
+                    else "STALE"
+                    HudLabel("OSC", oscLabel, oscColor)
+                    if (oscHealth.droppedFrames > 0) {
+                        HudLabel("DROP", "${oscHealth.droppedFrames}", Warn)
+                    }
+                }
                 Spacer(Modifier.height(8.dp))
                 HudLabel("MODE",  renderMode, Plasma)
                 HudLabel("TORCH", if (torchOn) "ON" else "OFF", if (torchOn) Plasma else Warn)
@@ -63,6 +99,13 @@ fun HudOverlay(
                 Spacer(Modifier.height(8.dp))
                 HudLabel("LMS",   landmarkCount.toString(), Plasma.copy(alpha = 0.7f))
                 HudLabel("SLOTS", activeSlots,              Plasma.copy(alpha = 0.7f))
+                // Hand side
+                val sideColor = when (handSide) {
+                    com.arhand.tracking.HandSide.PALM    -> Color(0xFF00E676)
+                    com.arhand.tracking.HandSide.BACK    -> Color(0xFF448AFF)
+                    com.arhand.tracking.HandSide.UNKNOWN -> Plasma.copy(alpha = 0.4f)
+                }
+                HudLabel("SIDE", handSide.name, sideColor)
                 // G4: Active gesture display
                 val gestureColor = if (activeGesture != null) Color(0xFF00E676) else Plasma.copy(alpha = 0.4f)
                 HudLabel(
@@ -70,6 +113,37 @@ fun HudOverlay(
                     activeGesture?.let { "${it.symbol} ${it.label}" } ?: "--",
                     gestureColor
                 )
+
+                // ARCH-4 — Pipeline quality and budget metrics
+                Spacer(Modifier.height(8.dp))
+                HudLabel("HAND", "%.0f%%".format(perf.handConfidence * 100f),
+                    if (perf.handConfidence > 0.7f) Color(0xFF00E676) else Warn)
+                if (perf.bodyConfidence > 0f || perf.bodyThrottled) {
+                    val bodyColor = when {
+                        perf.bodyThrottled   -> Warn
+                        perf.bodyConfidence > 0.6f -> Color(0xFF00BCD4)
+                        else -> Warn
+                    }
+                    HudLabel("BODY", "%.0f%%%s".format(
+                        perf.bodyConfidence * 100f,
+                        if (perf.bodyThrottled) "↓" else ""
+                    ), bodyColor)
+                }
+                if (perf.faceConfidence > 0f || perf.faceThrottled) {
+                    val faceColor = when {
+                        perf.faceThrottled   -> Warn
+                        perf.faceConfidence > 0.5f -> Color(0xFFE91E63)
+                        else -> Warn
+                    }
+                    HudLabel("FACE", "%.0f%%%s".format(
+                        perf.faceConfidence * 100f,
+                        if (perf.faceThrottled) "↓" else ""
+                    ), faceColor)
+                }
+                if (perf.activeModelCount > 1) {
+                    HudLabel("MDLS", "${perf.activeModelCount} / %.1fms".format(perf.totalInferenceMs),
+                        if (perf.totalInferenceMs > ModelBudgetManager.FRAME_BUDGET_MS) Warn else Plasma.copy(alpha = 0.7f))
+                }
             }
         }
     }

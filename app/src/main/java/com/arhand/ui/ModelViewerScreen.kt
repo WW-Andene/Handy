@@ -36,14 +36,22 @@ import kotlin.math.min
 @Composable
 fun ModelViewerScreen(
     meshPositions: FloatArray,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    /** ARCH-3 — Live retarget result from the tracking pipeline. Null = static mesh display. */
+    retargetResult: com.arhand.mocap.RetargetResult? = null,
+    /** ARCH-3 — Loaded skinned asset. When both this and [retargetResult] are non-null,
+     *  the viewer drives the character skeleton in real time. */
+    loadedAsset: com.arhand.mocap.LoadedAsset? = null
 ) {
     val viewerRenderer = remember { ModelViewerRenderer() }
 
-    // Keep renderer in sync with the latest mesh
+    // Keep renderer in sync with the latest mesh and live data
     LaunchedEffect(meshPositions) {
         viewerRenderer.meshPositions = meshPositions
     }
+    // ARCH-3 — Update live fields every recomposition (driven by State from AppViewModel)
+    viewerRenderer.retargetResult = retargetResult
+    viewerRenderer.loadedAsset    = loadedAsset
 
     Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0A0B0E))) {
 

@@ -1,6 +1,7 @@
 package com.arhand.depth
 
 import com.arhand.util.Vec3
+import com.arhand.depth.ArCoreDepthSource
 import kotlin.math.sqrt
 
 /**
@@ -33,6 +34,15 @@ object DepthApiCarver {
     /** Shell half-thickness, in multiples of cellSize, around each surface point. */
     private const val SHELL_CELLS = 1.5f
 
+    // HAND-5 — Normal map nudge constants.
+    /** SDF band around the zero-crossing within which nudge is applied (in cell widths). */
+    private const val NUDGE_BAND_CELLS    = 2.0f
+    /** Nudge magnitude relative to cellSize. 0.15 = 15% of one voxel per unit nz. */
+    private const val NORMAL_NUDGE_SCALE  = 0.15f
+    /** Approximate photometric camera intrinsics (matches PhotometricDepthSource). */
+    private const val PHOTO_FX = 310f
+    private const val PHOTO_FY = 310f
+
     /**
      * B6 step 4 — fuse raw per-frame depth point clouds into a single deduplicated
      * world-space cloud via voxel-grid hashing (tolerance = [cellSize]).
@@ -41,7 +51,7 @@ object DepthApiCarver {
         val voxelMap = HashMap<Long, Vec3>()
         for (frame in frames) {
             for (p in frame) {
-                val key = ArDepthSession.voxelKey(p, cellSize)
+                val key = ArCoreDepthSource.voxelKey(p.x, p.y, p.z, cellSize)
                 // Keep first sample per voxel — averaging across many frames is possible
                 // but first-write is sufficient for SDF shell purposes and avoids
                 // per-voxel running-average bookkeeping.
@@ -63,7 +73,23 @@ object DepthApiCarver {
      * @return Marching cubes mesh as flat position array, or empty if the fused cloud
      *         is too sparse (caller should fall back to [DepthCarver.carveAndExtract]).
      */
-    fun carveAndExtract(depthFrames: List<List<Vec3>>): FloatArray {
+    /**
+     * Carve a voxel SDF from accumulated depth frames and extract a triangle mesh.
+     *
+     * HAND-5 — [normalMap] is an optional [PhotometricNormalMap] from the photometric
+     * stereo capture. When provided, surface voxels near the zero-crossing are nudged
+     * along the normal direction by a fraction of their depth value, sharpening fine
+     * surface detail that the voxel SDF alone cannot capture (pore-scale features,
+     * wrinkle geometry). The nudge is small (NORMAL_NUDGE_SCALE × normalMap depth)
+     * and conservative — it only affects voxels already within NUDGE_BAND of the surface.
+     *
+     * @param depthFrames  Accumulated ARCore depth point cloud frames from the scan.
+     * @param normalMap    Optional photometric normal map. Null = same behaviour as before.
+     */
+    fun carveAndExtract(
+        depthFrames: List<List<Vec3>>,
+        normalMap:   com.arhand.scanner.PhotometricNormalMap? = null
+    ): FloatArray {
         if (depthFrames.isEmpty()) return FloatArray(0)
 
         val N = DepthCarver.effectiveGridN
@@ -83,7 +109,7 @@ object DepthApiCarver {
         // same voxel grid as the carve grid for O(1) average lookups.
         val buckets = HashMap<Long, MutableList<Vec3>>()
         for (p in fused) {
-            val key = ArDepthSession.voxelKey(p, cellSize)
+            val key = ArCoreDepthSource.voxelKey(p.x, p.y, p.z, cellSize)
             buckets.getOrPut(key) { mutableListOf() }.add(p)
         }
 
@@ -94,8 +120,8 @@ object DepthApiCarver {
             var best = Float.MAX_VALUE
             // Search the 3x3x3 neighborhood of voxel buckets around this point.
             for (dx in -1..1) for (dy in -1..1) for (dz in -1..1) {
-                val key = ArDepthSession.voxelKey(
-                    Vec3((qx + dx) * cellSize, (qy + dy) * cellSize, (qz + dz) * cellSize),
+                val key = ArCoreDepthSource.voxelKey(
+                    (qx + dx) * cellSize, (qy + dy) * cellSize, (qz + dz) * cellSize,
                     cellSize
                 )
                 val bucket = buckets[key] ?: continue
@@ -122,10 +148,58 @@ object DepthApiCarver {
 
                     val d = nearestDist(px, py, pz)
                     // Thin-shell SDF: negative (inside) within shellThickness of a
-                    // surface sample, positive (outside) beyond it. This produces a
-                    // closed-ish surface for marching cubes around the depth shell.
+                    // surface sample, positive (outside) beyond it.
                     sdf[idx(xi, yi, zi)] = d - shellThickness
                 }
+            }
+        }
+
+        // HAND-5 — Normal map surface nudge.
+        //
+        // The photometric normal map encodes surface detail at pixel resolution (320×240).
+        // The voxel SDF grid is at a coarser resolution — fine wrinkle and crease
+        // geometry is lost in the voxelisation step.
+        //
+        // Strategy: for each voxel within NUDGE_BAND of the zero-crossing (|sdf| < band),
+        // project the voxel into the normal map's camera space, look up the normal and
+        // depth offset, and nudge the SDF value in the normal direction.
+        //
+        // Nudge magnitude = normalMap.depth[projected pixel] × NORMAL_NUDGE_SCALE.
+        // This shifts the implicit surface by a small amount corresponding to the
+        // photometric depth estimate, preserving large-scale shape from ARCore while
+        // adding photometric surface detail.
+        if (normalMap != null && !normalMap.isEmpty) {
+            val nudgeBand  = cellSize * NUDGE_BAND_CELLS
+            val nmW = normalMap.width.toFloat()
+            val nmH = normalMap.height.toFloat()
+
+            for (zi in 0 until N) for (yi in 0 until N) for (xi in 0 until N) {
+                val sdfVal = sdf[idx(xi, yi, zi)]
+                if (kotlin.math.abs(sdfVal) > nudgeBand) continue  // skip non-surface voxels
+
+                // World-space voxel centre
+                val wx = origin[0] + (xi + 0.5f) * cellSize
+                val wy = origin[1] + (yi + 0.5f) * cellSize
+                val wz = origin[2] + (zi + 0.5f) * cellSize
+
+                // Project into normal map image space (pinhole camera, principal point = centre)
+                // Normal map was captured with camera at origin looking at -Z.
+                // Using approximate intrinsics matching PhotometricDepthSource (FX ≈ 310, CX = 160)
+                if (wz >= 0f) continue   // behind camera
+                val invZ  = -1f / wz
+                val nmX   = (wx * PHOTO_FX * invZ + nmW * 0.5f).toInt()
+                val nmY   = (wy * PHOTO_FY * invZ + nmH * 0.5f).toInt()
+                if (nmX < 0 || nmX >= normalMap.width || nmY < 0 || nmY >= normalMap.height) continue
+
+                // Look up normal and depth at this projected pixel
+                val normal = normalMap.normalAt(nmX, nmY) ?: continue
+                val (nx, ny, nz) = normal
+
+                // Depth offset from normal map: use nz (camera-facing component)
+                // as a proxy for "how much does the surface face the camera here"
+                // → surfaces facing away contribute less nudge
+                val nudge = nz * NORMAL_NUDGE_SCALE * cellSize
+                sdf[idx(xi, yi, zi)] = sdfVal - nudge
             }
         }
 

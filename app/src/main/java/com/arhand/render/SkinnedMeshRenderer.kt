@@ -139,6 +139,65 @@ class SkinnedMeshRenderer {
     }
 
     /**
+     * Gap 4 — Drive body skeleton joints from [BodyRetargetResult].
+     *
+     * Uses [LoadedAsset.bodyJointMap] to map [BodyJoint] enum values to glTF node
+     * indices, then builds skin matrices for those nodes from the body rotation data.
+     * Called every frame alongside [updatePose] when body tracking is active.
+     *
+     * Safe to call with null — no-ops silently so the hand-only path is unaffected.
+     */
+    fun updateBodyPose(
+        bodyResult: com.arhand.mocap.BodyRetargetResult?,
+        asset:      com.arhand.mocap.LoadedAsset?
+    ) {
+        if (bodyResult == null || asset == null) return
+        val jointMap = asset.bodyJointMap
+        if (jointMap.isEmpty()) return
+
+        val palette  = bonePalette.copyOf()   // start from current hand palette
+
+        for ((bodyJoint, nodeIdx) in jointMap) {
+            val rot = bodyResult.joints[bodyJoint] ?: continue
+            if (nodeIdx < 0 || nodeIdx >= asset.jointNodeIndices.size) continue
+
+            val jointMat = rot.toMatrix()
+
+            // Apply Hips root translation when this is the root body joint
+            if (bodyJoint == com.arhand.mocap.BodyJoint.HIPS) {
+                // Centre body on-screen — use a fixed offset so it doesn't drift
+                jointMat[12] = 0f; jointMat[13] = 0f; jointMat[14] = -1f
+            }
+
+            val ibm = asset.inverseBindMatrices.getOrNull(nodeIdx) ?: identityMatrix()
+            val skinMat = FloatArray(16)
+            android.opengl.Matrix.multiplyMM(skinMat, 0, jointMat, 0, ibm, 0)
+
+            // Write into palette at the correct slot
+            val paletteIdx = nodeIdx.coerceIn(0, BoneRetargeter.JOINT_COUNT - 1)
+            skinMat.copyInto(palette, paletteIdx * 16)
+        }
+
+        bonePalette = palette
+        poseDirty   = true
+    }
+     *
+     * Currently a stub: the weight list is stored but not yet applied to vertex
+     * positions on the GPU. Full implementation requires adding morph delta buffers
+     * to the vertex shader (planned in a future sprint once the parser and data flow
+     * are validated end-to-end).
+     *
+     * Calling this method is safe and has no visible effect on the current mesh.
+     * It is called every frame when face tracking is active and a VRM asset is loaded.
+     */
+    fun applyMorphWeights(applications: List<com.arhand.mocap.MorphApplication>) {
+        // Store for future GPU upload — no-op until shader morph support is added
+        pendingMorphApplications = applications
+    }
+
+    @Volatile private var pendingMorphApplications: List<com.arhand.mocap.MorphApplication> = emptyList()
+
+    /**
      * Draw the skinned mesh. Must be called on the GL thread.
      *
      * @param view       View matrix from [ARRenderer]

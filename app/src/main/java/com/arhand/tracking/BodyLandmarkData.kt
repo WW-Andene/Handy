@@ -123,6 +123,16 @@ object FL {
     // ── Jaw ───────────────────────────────────────────────────────────────
     const val JAW_LEFT   = 172
     const val JAW_RIGHT  = 397
+
+    // ── Iris landmarks (FACE-2) ───────────────────────────────────────────────
+    // MediaPipe 478-landmark model: indices 468–477 are iris points.
+    // 468–471 = left iris ring; 468 = left iris centre (closest to centre of ring).
+    // 473–476 = right iris ring; 473 = right iris centre.
+    // Eye orbit corners used as the gaze normalisation reference frame:
+    const val LEFT_IRIS_CENTER  = 468
+    const val RIGHT_IRIS_CENTER = 473
+    const val LEFT_EYE_INNER    = 133   // inner eye corner (nose side)
+    const val RIGHT_EYE_INNER   = 362   // inner eye corner (nose side)
 }
 
 // ─── Unified full-body frame ──────────────────────────────────────────────────
@@ -138,5 +148,14 @@ data class FullBodyFrame(
     val pose:  PoseLandmarks?,
     val face:  FaceLandmarks?,
     val leftHand:  List<Landmark>?,   // HandPipeline slot mapped to left hand
-    val rightHand: List<Landmark>?    // HandPipeline slot mapped to right hand
+    val rightHand: List<Landmark>?,   // HandPipeline slot mapped to right hand
+    /**
+     * FACE-3 — Derived face expression intensities for the same frame.
+     *
+     * Populated in [com.arhand.ui.AppViewModel.ensureFullBodyCollector] from
+     * [com.arhand.tracking.FacePipeline.expressions] when face tracking is active.
+     * Allows [CompositeGestureClassifier.classify] to use the correct overload that
+     * reads expression values rather than always returning [FaceModifier.NONE].
+     */
+    val expressions: FaceExpressions? = null
 )

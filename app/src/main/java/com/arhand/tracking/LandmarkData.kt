@@ -4,7 +4,17 @@ package com.arhand.tracking
  * Single hand landmark.
  * @param x          Normalized [0,1] horizontal position
  * @param y          Normalized [0,1] vertical position
- * @param z          Relative depth (MediaPipe proxy, not metric)
+ * @param z          Relative depth (MediaPipe proxy, not metric) — used by TDF
+ * @param worldX     Metric X position in meters from MediaPipe world landmarks (hand-center origin).
+ *                   Removes the projection distortion present in the normalized [x] coordinate.
+ *                   Defaults to 0f when world landmarks are unavailable.
+ * @param worldY     Metric Y position in meters from MediaPipe world landmarks (hand-center origin).
+ *                   Removes the projection distortion present in the normalized [y] coordinate.
+ *                   Defaults to 0f when world landmarks are unavailable.
+ * @param worldZ     Metric depth in meters from MediaPipe world landmarks (hand-center origin).
+ *                   More stable and geometrically correct than the normalized z proxy.
+ *                   Used by landmarkToWorld() for rendering, scanning, and mocap.
+ *                   Defaults to 0f when world landmarks are unavailable.
  * @param inferred   True if this landmark was reconstructed by OcclusionEngine
  * @param visibility A6: MediaPipe model-confidence score [0,1] for this landmark.
  *                   0 = model considers the point unreliable; 1 = fully confident.
@@ -14,6 +24,9 @@ data class Landmark(
     val x: Float,
     val y: Float,
     val z: Float,
+    val worldX: Float = 0f,
+    val worldY: Float = 0f,
+    val worldZ: Float = 0f,
     val inferred: Boolean = false,
     val visibility: Float = 1.0f
 )

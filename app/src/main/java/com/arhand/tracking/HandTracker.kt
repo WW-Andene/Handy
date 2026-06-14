@@ -55,19 +55,30 @@ class HandTracker(
     }
 
     /**
-     * A1: Probe delegate availability at runtime.
-     * Delegate.NNAPI was removed in MediaPipe Tasks SDK 0.10.14 — the Hexagon DSP path
-     * now routes automatically through the GPU delegate on Snapdragon via the NNAPI HAL.
-     * Try GPU first; fall back to CPU.
+     * A1: Probe delegate availability by attempting to create a real HandLandmarker.
+     *
+     * Bug 15 fix: BaseOptions.build() does not initialise the delegate and never throws,
+     * so the previous probe loop always selected GPU regardless of actual availability.
+     * The real failure only surfaces inside HandLandmarker.createFromOptions().
+     *
+     * We build a minimal result-listener-free instance just to test the delegate, then
+     * immediately close it. Cost: one model load (~50ms) during app startup — acceptable.
      */
     private fun selectDelegate(): Delegate {
         for (candidate in listOf(Delegate.GPU, Delegate.CPU)) {
             try {
-                // Attempt to build a minimal BaseOptions with this delegate — throws if unsupported
-                BaseOptions.builder()
+                val baseOpts = BaseOptions.builder()
                     .setModelAssetPath("hand_landmarker.task")
                     .setDelegate(candidate)
                     .build()
+                // Use VIDEO mode so no result listener is required — we just need to know
+                // if createFromOptions succeeds without throwing.
+                val probeOpts = HandLandmarker.HandLandmarkerOptions.builder()
+                    .setBaseOptions(baseOpts)
+                    .setRunningMode(RunningMode.IMAGE)
+                    .setNumHands(1)
+                    .build()
+                HandLandmarker.createFromOptions(context, probeOpts).close()
                 Log.i("HandTracker", "Using delegate: $candidate")
                 return candidate
             } catch (e: Exception) {
@@ -106,15 +117,24 @@ class HandTracker(
 
         if (landmarks.isEmpty()) return emptyList()
 
+        // World landmarks: metric 3D coordinates (meters), origin at hand geometric center.
+        // Available since MediaPipe Tasks Vision 0.10.0. More stable Z than normalized proxy.
+        val worldLandmarks = result.worldLandmarks()
+
         // Build a nullable 2-slot array: slot 0 = Right, slot 1 = Left
         val slots = arrayOfNulls<HandLandmarks>(2)
 
         for (i in landmarks.indices) {
-            val lms = landmarks[i].map { lm ->
+            val worldLms = worldLandmarks.getOrNull(i)
+            val lms = landmarks[i].mapIndexed { j, lm ->
+                val wlm = worldLms?.getOrNull(j)
                 Landmark(
                     x          = lm.x(),
                     y          = lm.y(),
                     z          = lm.z(),
+                    worldX     = wlm?.x() ?: 0f,   // BUG-2: was silently discarded
+                    worldY     = wlm?.y() ?: 0f,   // BUG-2: was silently discarded
+                    worldZ     = wlm?.z() ?: 0f,
                     visibility = lm.visibility().orElse(1.0f)  // A6: forward model confidence
                 )
             }

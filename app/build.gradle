@@ -13,6 +13,12 @@ android {
         targetSdk 34
         versionCode 1
         versionName "1.0"
+
+        // Item 4 — SMPL/BODY-8 feature flag.
+        // Set to true only for internal research builds — the BODY-8 model weights
+        // (if added) carry a non-commercial research licence and must not ship in
+        // paid distribution. Keep false for all public / Play Store builds.
+        buildConfigField "boolean", "FEATURE_SMPL_BODY", "false"
     }
 
     buildTypes {
@@ -34,6 +40,7 @@ android {
 
     buildFeatures {
         compose true
+        buildConfig true   // Item 4 — needed for FEATURE_SMPL_BODY flag
     }
 
     composeOptions {
@@ -42,6 +49,16 @@ android {
 }
 
 dependencies {
+    // R2 — All library modules
+    implementation project(':util')
+    implementation project(':tracking')
+    implementation project(':depth')
+    implementation project(':scanner')
+    implementation project(':mocap')
+    implementation project(':render')
+    implementation project(':export')
+    implementation project(':camera')
+
     // AppCompat — required for theme base
     implementation 'androidx.appcompat:appcompat:1.7.0'
 
@@ -51,7 +68,7 @@ dependencies {
     // MediaPipe Tasks Vision — hand tracking, offline
     implementation 'com.google.mediapipe:tasks-vision:0.10.14'
 
-    // B6 — ARCore Depth API integration (Phase 2)
+    // ARCore
     implementation 'com.google.ar:core:1.42.0'
 
     // Jetpack Compose
@@ -68,13 +85,13 @@ dependencies {
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.0'
     implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.0'
 
-    // DataStore — replaces localStorage
+    // DataStore
     implementation 'androidx.datastore:datastore-preferences:1.1.1'
 
     // Coroutines
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
 
-    // Unit tests — JVM only, no Android deps required
+    // Unit tests
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.jetbrains.kotlin:kotlin-test:1.9.24'
 }

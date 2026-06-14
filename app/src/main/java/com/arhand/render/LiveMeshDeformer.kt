@@ -83,6 +83,13 @@ class LiveMeshDeformer {
      *                            Length must be JOINT_COUNT × 3.
      */
     fun buildSkinWeights(meshPositions: FloatArray, restJointPositions: FloatArray) {
+
+        // Accessing restJointPositions[i * 3 + 2] for i up to JOINT_COUNT-1 requires at least
+        // JOINT_COUNT*3 = 48 elements — throw a clear error rather than an AIOOBE.
+        require(restJointPositions.size >= JOINT_COUNT * 3) {
+            "restJointPositions must have at least ${JOINT_COUNT * 3} elements " +
+            "(got ${restJointPositions.size})"
+        }
         val vc = meshPositions.size / 3
         vertexCount   = vc
         restPositions = meshPositions.copyOf()

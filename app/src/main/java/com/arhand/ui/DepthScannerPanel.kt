@@ -12,6 +12,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arhand.scanner.PhotometricStereoCapture
+import com.arhand.feature.scan.NeuralReconDiagnostics
 
 /**
  * Phase 2 placeholder — ARCore Depth API panel.
@@ -56,12 +57,14 @@ fun DepthScannerPanel(
                     fontFamily = FontFamily.Monospace)
                 Text(
                     text = when {
-                        !depthApiAvailable -> "UNAVAIL"
-                        depthMode          -> "ACTIVE"
-                        else               -> "PHASE 2"
+                        isFrontCamera      -> "REAR ONLY"
+                        !depthApiAvailable -> "SFM ONLY"
+                        depthMode          -> "TSDF ON"
+                        else               -> "TSDF OFF"
                     },
                     fontSize = 12.sp,
                     color = when {
+                        isFrontCamera      -> Color.White.copy(0.2f)
                         !depthApiAvailable -> Color.White.copy(0.2f)
                         depthMode          -> Plasma
                         else               -> Color.White.copy(0.3f)
@@ -82,7 +85,7 @@ fun DepthScannerPanel(
             CtrlButton(
                 label = if (depthMode) "DEPTH\nON" else "DEPTH\nOFF",
                 active = depthMode,
-                onClick = onToggleDepth
+                onClick = if (!isFrontCamera) onToggleDepth else ({})
             )
         }
 

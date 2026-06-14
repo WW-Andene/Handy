@@ -1,5 +1,6 @@
 package com.arhand.mocap
 
+import com.arhand.tracking.FaceExpressions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -60,7 +61,9 @@ enum class OscSchema {
     HANDY_DEFAULT,
     VMC,
     UNREAL_LIVE_LINK,
-    VSEEFACE;
+    VSEEFACE,
+    /** OSC-3 — VTube Studio parameter injection format. */
+    VTUBE_STUDIO;
 
     /** Short display label for UI chips. */
     val label: String get() = when (this) {
@@ -68,6 +71,7 @@ enum class OscSchema {
         VMC              -> "VMC"
         UNREAL_LIVE_LINK -> "UE LL"
         VSEEFACE         -> "VSF"
+        VTUBE_STUDIO     -> "VTS"
     }
 
     /** Longer description for settings/tooltips. */
@@ -76,131 +80,7 @@ enum class OscSchema {
         VMC              -> "VirtualMotionCapture / VSeeFace v2.3 (/VMC/Ext/Bon/Rot)"
         UNREAL_LIVE_LINK -> "Unreal LiveLink OSC (/LiveLink/<Subject>/Bone/<Joint>)"
         VSEEFACE         -> "VSeeFace legacy (/VMC/Ext/Bone/Pos)"
-    }
-}
-
-// ─── Schema address tables ────────────────────────────────────────────────────
-
-/**
- * Maps schema → (jointIndex → OSC address bytes).
- * Built once at class load; all entries are pre-padded to 4-byte boundaries.
- */
-private object SchemaAddresses {
-
-    // --- Handy native ---
-    // /hand/<JointName>/rotation
-    private val handyJointNames = mapOf(
-        BoneRetargeter.JOINT_WRIST       to "Wrist",
-        BoneRetargeter.JOINT_THUMB_CMC   to "ThumbCMC",
-        BoneRetargeter.JOINT_THUMB_MCP   to "ThumbMCP",
-        BoneRetargeter.JOINT_THUMB_IP    to "ThumbIP",
-        BoneRetargeter.JOINT_INDEX_MCP   to "IndexMCP",
-        BoneRetargeter.JOINT_INDEX_PIP   to "IndexPIP",
-        BoneRetargeter.JOINT_INDEX_DIP   to "IndexDIP",
-        BoneRetargeter.JOINT_MIDDLE_MCP  to "MiddleMCP",
-        BoneRetargeter.JOINT_MIDDLE_PIP  to "MiddlePIP",
-        BoneRetargeter.JOINT_MIDDLE_DIP  to "MiddleDIP",
-        BoneRetargeter.JOINT_RING_MCP    to "RingMCP",
-        BoneRetargeter.JOINT_RING_PIP    to "RingPIP",
-        BoneRetargeter.JOINT_RING_DIP    to "RingDIP",
-        BoneRetargeter.JOINT_PINKY_MCP   to "PinkyMCP",
-        BoneRetargeter.JOINT_PINKY_PIP   to "PinkyPIP",
-        BoneRetargeter.JOINT_PINKY_DIP   to "PinkyDIP"
-    )
-
-    // --- VMC v2.3 bone names ---
-    // Reference: https://protocol.vmc.info/marionette-spec  (VirtualMotionCapture OSC Protocol)
-    // Address: /VMC/Ext/Bon/Rot   args: string boneName, float qx, qy, qz, qw
-    // The bone name is sent as an OSC string argument, not encoded in the address.
-    // We still need per-joint address bytes (all the same "/VMC/Ext/Bon/Rot") and
-    // a pre-built bone-name string argument per joint.
-    private val vmcBoneNames = mapOf(
-        BoneRetargeter.JOINT_WRIST       to "RightHand",
-        BoneRetargeter.JOINT_THUMB_CMC   to "RightThumbProximal",
-        BoneRetargeter.JOINT_THUMB_MCP   to "RightThumbIntermediate",
-        BoneRetargeter.JOINT_THUMB_IP    to "RightThumbDistal",
-        BoneRetargeter.JOINT_INDEX_MCP   to "RightIndexProximal",
-        BoneRetargeter.JOINT_INDEX_PIP   to "RightIndexIntermediate",
-        BoneRetargeter.JOINT_INDEX_DIP   to "RightIndexDistal",
-        BoneRetargeter.JOINT_MIDDLE_MCP  to "RightMiddleProximal",
-        BoneRetargeter.JOINT_MIDDLE_PIP  to "RightMiddleIntermediate",
-        BoneRetargeter.JOINT_MIDDLE_DIP  to "RightMiddleDistal",
-        BoneRetargeter.JOINT_RING_MCP    to "RightRingProximal",
-        BoneRetargeter.JOINT_RING_PIP    to "RightRingIntermediate",
-        BoneRetargeter.JOINT_RING_DIP    to "RightRingDistal",
-        BoneRetargeter.JOINT_PINKY_MCP   to "RightLittleProximal",
-        BoneRetargeter.JOINT_PINKY_PIP   to "RightLittleIntermediate",
-        BoneRetargeter.JOINT_PINKY_DIP   to "RightLittleDistal"
-    )
-
-    // --- Unreal LiveLink OSC bone names ---
-    // Address: /LiveLink/<SubjectName>/Bone/<BoneName>  args: float qx, qy, qz, qw
-    // Subject name is configurable; we default to "Hand".
-    // UE LiveLink uses Mixamo-compatible bone names for hand rigs.
-    private val unrealBoneNames = mapOf(
-        BoneRetargeter.JOINT_WRIST       to "RightHand",
-        BoneRetargeter.JOINT_THUMB_CMC   to "RightHandThumb1",
-        BoneRetargeter.JOINT_THUMB_MCP   to "RightHandThumb2",
-        BoneRetargeter.JOINT_THUMB_IP    to "RightHandThumb3",
-        BoneRetargeter.JOINT_INDEX_MCP   to "RightHandIndex1",
-        BoneRetargeter.JOINT_INDEX_PIP   to "RightHandIndex2",
-        BoneRetargeter.JOINT_INDEX_DIP   to "RightHandIndex3",
-        BoneRetargeter.JOINT_MIDDLE_MCP  to "RightHandMiddle1",
-        BoneRetargeter.JOINT_MIDDLE_PIP  to "RightHandMiddle2",
-        BoneRetargeter.JOINT_MIDDLE_DIP  to "RightHandMiddle3",
-        BoneRetargeter.JOINT_RING_MCP    to "RightHandRing1",
-        BoneRetargeter.JOINT_RING_PIP    to "RightHandRing2",
-        BoneRetargeter.JOINT_RING_DIP    to "RightHandRing3",
-        BoneRetargeter.JOINT_PINKY_MCP   to "RightHandPinky1",
-        BoneRetargeter.JOINT_PINKY_PIP   to "RightHandPinky2",
-        BoneRetargeter.JOINT_PINKY_DIP   to "RightHandPinky3"
-    )
-
-    // --- VSeeFace legacy: same addresses as VMC, kept as a separate preset so
-    //     users on the VSeeFace "Direct" OSC tab (which does not follow v2.3 spec
-    //     fully) can select it without touching VMC settings. Address is
-    //     /VMC/Ext/Bone/Pos (note: "Bone" not "Bon", and "Pos" not "Rot") —
-    //     VSeeFace legacy sends position + quaternion as a single blob.
-    // We encode it the same as VMC but with the legacy address so the receiver
-    // picks it up on the correct address filter.
-    // Reference: VSeeFace OSC documentation (https://www.vseeface.icu/#osc-control)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // Pre-built address byte arrays ───────────────────────────────────────────
-
-    val handyRotAddr:  Map<Int, ByteArray> = MotionRecorder.HIERARCHY_ORDER.associateWith { j ->
-        val name = handyJointNames[j] ?: "Joint$j"
-        oscString("/hand/$name/rotation")
-    }
-    val handyPosAddr:  ByteArray = oscString("/hand/wrist/position")
-
-    // VMC: single address "/VMC/Ext/Bon/Rot" for all joints; bone name in args
-    val vmcRotAddr:    ByteArray = oscString("/VMC/Ext/Bon/Rot")
-    val vmcPosAddr:    ByteArray = oscString("/VMC/Ext/Bon/Rot")   // wrist pos also via Bon/Rot
-    val vmcBoneBytes:  Map<Int, ByteArray> = MotionRecorder.HIERARCHY_ORDER.associateWith { j ->
-        oscString(vmcBoneNames[j] ?: "RightHand")
-    }
-    val vmcWristBone:  ByteArray = oscString("RightHand")
-
-    // Unreal LiveLink: address per bone "/LiveLink/Hand/Bone/<BoneName>"
-    val unrealRotAddr: Map<Int, ByteArray> = MotionRecorder.HIERARCHY_ORDER.associateWith { j ->
-        val bone = unrealBoneNames[j] ?: "RightHand"
-        oscString("/LiveLink/Hand/Bone/$bone")
-    }
-    val unrealPosAddr: ByteArray = oscString("/LiveLink/Hand/Root")
-
-    // VSeeFace legacy: "/VMC/Ext/Bone/Pos" with bone name in args
-    val vsfRotAddr:    ByteArray = oscString("/VMC/Ext/Bone/Pos")
-    val vsfPosAddr:    ByteArray = oscString("/VMC/Ext/Bone/Pos")
-    // VSeeFace reuses VMC bone names
-    val vsfBoneBytes:  Map<Int, ByteArray> = vmcBoneBytes
-    val vsfWristBone:  ByteArray = vmcWristBone
-
-    /** Pad a string to the next 4-byte boundary with null bytes, as required by OSC 1.0. */
-    fun oscString(s: String): ByteArray {
-        val raw = s.toByteArray(StandardCharsets.US_ASCII) + byteArrayOf(0)
-        val pad = (4 - raw.size % 4) % 4
-        return raw + ByteArray(pad)
+        VTUBE_STUDIO     -> "VTube Studio parameter injection (/VTubeStudioInternal/...)"
     }
 }
 
@@ -262,6 +142,13 @@ private object SchemaAddresses {
  */
 class OscStreamer {
 
+    /**
+     * Gap 3 — OSC connection health monitor.
+     * Tracks sent/dropped frame counts and rolling frame rate.
+     * Exposed so [AppViewModel] can collect it for HUD display.
+     */
+    val health = OscHealthMonitor()
+
     companion object {
         const val DEFAULT_PORT       = 9000
         const val DEFAULT_HOST       = "255.255.255.255"   // LAN broadcast
@@ -277,7 +164,31 @@ class OscStreamer {
             OscSchema.VSEEFACE         -> VMC_PORT
             OscSchema.UNREAL_LIVE_LINK -> UNREAL_LL_PORT
             OscSchema.HANDY_DEFAULT    -> DEFAULT_PORT
+            OscSchema.VTUBE_STUDIO     -> DEFAULT_PORT
         }
+
+        /**
+         * IMP-5 — Joint index → URL-safe name used in `/hand/<name>/velocity` messages.
+         * Mirrors the display names in [MotionRecorder.JOINT_NAMES] as lowercase strings.
+         */
+        val JOINT_VELOCITY_NAMES: Map<Int, String> = mapOf(
+            BoneRetargeter.JOINT_WRIST       to "wrist",
+            BoneRetargeter.JOINT_THUMB_CMC   to "thumbCMC",
+            BoneRetargeter.JOINT_THUMB_MCP   to "thumbMCP",
+            BoneRetargeter.JOINT_THUMB_IP    to "thumbIP",
+            BoneRetargeter.JOINT_INDEX_MCP   to "indexMCP",
+            BoneRetargeter.JOINT_INDEX_PIP   to "indexPIP",
+            BoneRetargeter.JOINT_INDEX_DIP   to "indexDIP",
+            BoneRetargeter.JOINT_MIDDLE_MCP  to "middleMCP",
+            BoneRetargeter.JOINT_MIDDLE_PIP  to "middlePIP",
+            BoneRetargeter.JOINT_MIDDLE_DIP  to "middleDIP",
+            BoneRetargeter.JOINT_RING_MCP    to "ringMCP",
+            BoneRetargeter.JOINT_RING_PIP    to "ringPIP",
+            BoneRetargeter.JOINT_RING_DIP    to "ringDIP",
+            BoneRetargeter.JOINT_PINKY_MCP   to "pinkyMCP",
+            BoneRetargeter.JOINT_PINKY_PIP   to "pinkyPIP",
+            BoneRetargeter.JOINT_PINKY_DIP   to "pinkyDIP"
+        )
 
         // OSC bundle header: "#bundle\0" + timetag (immediate = 1)
         private val BUNDLE_HEADER: ByteArray = run {
@@ -303,6 +214,25 @@ class OscStreamer {
         private val TYPE_SFFFF = ",sffff\u0000\u0000".toByteArray(StandardCharsets.US_ASCII)
         // ,sfff padded to 8 bytes (1 string arg + 3 floats = VMC wrist pos)
         private val TYPE_SFFF  = ",sfff\u0000\u0000\u0000".toByteArray(StandardCharsets.US_ASCII)
+        // ,f padded to 4 bytes (1 float — used by face blend-shape messages / velocity channel)
+        private val TYPE_F = ",f\u0000\u0000".toByteArray(StandardCharsets.US_ASCII)
+    }
+
+    // ─── OSC single-float message builder ─────────────────────────────────────
+
+    /**
+     * Build a minimal OSC 1.0 message carrying a single float value.
+     * Used by IMP-11 (face blend shapes) and IMP-5 (velocity channel).
+     *
+     * Layout: [oscString address] [",f\0\0"] [float32 BE]
+     */
+    private fun buildOscFloat(address: String, value: Float): ByteArray {
+        val addrB = SchemaAddresses.oscString(address)
+        val buf   = ByteBuffer.allocate(addrB.size + TYPE_F.size + 4).order(ByteOrder.BIG_ENDIAN)
+        buf.put(addrB)
+        buf.put(TYPE_F)
+        buf.putFloat(value)
+        return buf.array()
     }
 
     // ─── State ────────────────────────────────────────────────────────────────
@@ -330,6 +260,10 @@ class OscStreamer {
 
     private var scope:   CoroutineScope? = null
     private var socket:  DatagramSocket? = null
+
+    // sendVelocityFrame() don't call InetAddress.getByName() on the tracking thread every
+    // frame — a DNS lookup that can block for 10–100 ms on non-literal hostnames.
+    private var resolvedAddress: InetAddress? = null
     private var channel: Channel<RetargetResult>? = null
 
     // ─── Lifecycle ────────────────────────────────────────────────────────────
@@ -372,6 +306,7 @@ class OscStreamer {
             channel = null
             return
         }
+        resolvedAddress = address
 
         scope = CoroutineScope(Dispatchers.IO + Job()).also { sc ->
             sc.launch {
@@ -381,7 +316,9 @@ class OscStreamer {
                         val bundle = buildBundle(result)
                         val packet = DatagramPacket(bundle, bundle.size, address, port)
                         skt.send(packet)
+                        health.onFrameSent()
                     } catch (_: Exception) {
+                        health.onFrameDropped()
                         // Socket may have been closed — loop exits when scope is cancelled
                     }
                 }
@@ -396,16 +333,36 @@ class OscStreamer {
      * Safe to call multiple times or before [start].
      */
     fun stop() {
-        isStreaming = false
+        isStreaming     = false
         scope?.cancel()
-        scope   = null
+        scope           = null
         socket?.close()
-        socket  = null
+        socket          = null
+        resolvedAddress = null
         channel?.close()
-        channel = null
+        channel         = null
+        health.reset()  // Gap 3
     }
 
     // ─── Frame send ──────────────────────────────────────────────────────────
+
+    /**
+     * IMP-11 — When true, [sendFaceFrame] emits face blend-shape floats as
+     * ARKit-compatible OSC messages alongside the joint rotation bundle.
+     * Receivers that don't understand face addresses silently ignore them.
+     * Default: false (opt-in; no breaking change to existing receivers).
+     */
+    @Volatile
+    var sendFace: Boolean = false
+
+    /**
+     * IMP-5 — When true, per-joint angular velocity (rad/s) is emitted as
+     * `/hand/<joint>/velocity` float messages alongside rotation messages.
+     * Requires IMP-1 QuaternionEmaFilter to have populated lastAngularVelocity.
+     * Default: false (opt-in).
+     */
+    @Volatile
+    var sendVelocity: Boolean = false
 
     /**
      * Enqueue a retarget result for transmission.
@@ -418,6 +375,137 @@ class OscStreamer {
     fun sendFrame(result: RetargetResult) {
         if (!isStreaming) return
         channel?.trySend(result)
+    }
+
+    /**
+     * ARCH-1 — Unified send path for a complete [FullBodyRetargetResult] frame.
+     *
+     * OSC-1: For VMC and VSEEFACE schemas, builds a bundle containing both hand
+     * and body joints using [buildBundleVmcFull]. For other schemas, falls back
+     * to the existing hand-only channel path.
+     *
+     * Face expressions are emitted separately via [sendFaceFrame] when [sendFace] is true.
+     * Joints absent from [FullBodyRetargetResult.body] are omitted (receiver uses T-pose).
+     */
+    fun sendFrame(full: FullBodyRetargetResult) {
+        if (!isStreaming) return
+        val skt  = socket ?: return
+        val addr = resolvedAddress ?: return
+
+        when (schema) {
+            OscSchema.VMC, OscSchema.VSEEFACE -> {
+                // OSC-1: direct send of the full bundle (hand + body in one packet)
+                try {
+                    val bundle = buildBundleVmcFull(full)
+                    skt.send(DatagramPacket(bundle, bundle.size, addr, port))
+                } catch (_: Exception) {}
+            }
+            OscSchema.VTUBE_STUDIO -> {
+                // OSC-3: VTS parameter injection — use primary hand result
+                full.handPrimary?.let { channel?.trySend(it) }
+            }
+            else -> {
+                // Other schemas: route primary hand through existing channel
+                full.handPrimary?.let { channel?.trySend(it) }
+            }
+        }
+
+        // Face expressions (schema-independent)
+        if (sendFace && full.face != null) {
+            sendFaceFrame(full.face)
+        }
+    }
+
+    /**
+     * IMP-11 — Emit face blend-shape values as OSC float messages using ARKit-compatible
+     * addresses. Each expression maps to a single `/face/<name>` float in [0, 1].
+     *
+     * Address → ARKit name mapping (VSeeFace / VTube Studio compatible):
+     *   leftBlink      → /face/eyeBlinkLeft
+     *   rightBlink     → /face/eyeBlinkRight
+     *   jawOpen        → /face/jawOpen
+     *   leftBrowRaise  → /face/browInnerUp
+     *   rightBrowRaise → /face/browOuterUpRight
+     *   mouthSmile     → /face/mouthSmileLeft  (single symmetric value)
+     *
+     * Only sent when [sendFace] is true and streaming is active. Existing
+     * receivers that don't recognise these addresses ignore them — no breakage.
+     */
+    fun sendFaceFrame(fe: FaceExpressions) {
+        if (!isStreaming || !sendFace) return
+        val skt  = socket ?: return
+        val addr = resolvedAddress ?: return
+
+        val faceMessages = listOf(
+            Pair("/face/eyeBlinkLeft",      fe.leftBlink),
+            Pair("/face/eyeBlinkRight",     fe.rightBlink),
+            Pair("/face/jawOpen",           fe.jawOpen),
+            Pair("/face/browInnerUp",       fe.leftBrowRaise),
+            Pair("/face/browOuterUpRight",  fe.rightBrowRaise),
+            Pair("/face/mouthSmileLeft",    fe.mouthSmile),
+            Pair("/face/mouthSmileRight",   fe.mouthSmile),
+            // FACE-2 — iris gaze (VSeeFace / VTube Studio compatible)
+            Pair("/face/eyeLeftX",          fe.leftGazeH),
+            Pair("/face/eyeLeftY",          fe.leftGazeV),
+            Pair("/face/eyeRightX",         fe.rightGazeH),
+            Pair("/face/eyeRightY",         fe.rightGazeV)
+        )
+
+        for ((address, value) in faceMessages) {
+            try {
+                val msg = buildOscFloat(address, value)
+                skt.send(DatagramPacket(msg, msg.size, addr, port))
+            } catch (_: Exception) {}
+        }
+
+        // OSC-2 — VMC /VMC/Ext/Blendshape: VRM expression preset names
+        if (schema == OscSchema.VMC || schema == OscSchema.VSEEFACE) {            val vmcBlendAddr = SchemaAddresses.oscString("/VMC/Ext/Blendshape")
+            val vmcBlendMessages = listOf(
+                "Blink_L" to fe.leftBlink,
+                "Blink_R" to fe.rightBlink,
+                "O"       to fe.jawOpen,
+                "Joy"     to fe.mouthSmile
+            ).filter { it.second > 0.01f }
+            for ((name, value) in vmcBlendMessages) {
+                try {
+                    val nameBytes = SchemaAddresses.oscString(name)
+                    val typetag = ",sf\u0000\u0000\u0000\u0000\u0000".toByteArray(StandardCharsets.US_ASCII)
+                    val buf = ByteBuffer.allocate(vmcBlendAddr.size + typetag.size + nameBytes.size + 4)
+                        .order(ByteOrder.BIG_ENDIAN)
+                    buf.put(vmcBlendAddr); buf.put(typetag); buf.put(nameBytes); buf.putFloat(value)
+                    val bytes = buf.array().copyOf(buf.position())
+                    skt.send(DatagramPacket(bytes, bytes.size, addr, port))
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    // ─── IMP-5: velocity channel ──────────────────────────────────────────────
+
+    /**
+     * IMP-5 — Emit per-joint angular velocity as `/hand/<joint>/velocity` float messages.
+     *
+     * Velocity is computed by [QuaternionEmaFilter] as a byproduct — zero extra
+     * differentiation. Receiving tools (VSeeFace, Warudo, Unity spring solvers) can use
+     * these directly rather than differentiating consecutive quaternion frames.
+     *
+     * Only sent when [sendVelocity] is true. Existing receivers ignore unknown addresses.
+     *
+     * @param angularVelocity  Map of joint index → angular speed in rad/frame,
+     *                         as produced by [QuaternionEmaFilter.lastAngularVelocity].
+     */
+    fun sendVelocityFrame(angularVelocity: Map<Int, Float>) {
+        if (!isStreaming || !sendVelocity || angularVelocity.isEmpty()) return
+        val skt  = socket ?: return
+        val addr = resolvedAddress ?: return
+
+        for ((jointIdx, vel) in angularVelocity) {
+            val jointName = JOINT_VELOCITY_NAMES[jointIdx] ?: continue
+            try {
+                val msg = buildOscFloat("/hand/$jointName/velocity", vel)
+                skt.send(DatagramPacket(msg, msg.size, addr, port))
+            } catch (_: Exception) {}
+        }
     }
 
     // ─── OSC bundle builder ───────────────────────────────────────────────────
@@ -436,6 +524,132 @@ class OscStreamer {
                                                               SchemaAddresses.vsfWristBone,
                                                               SchemaAddresses.vsfPosAddr)
         OscSchema.UNREAL_LIVE_LINK -> buildBundleUnreal(result)
+        OscSchema.VTUBE_STUDIO     -> buildBundleVtubeStudio(result)
+    }
+
+    /**
+     * OSC-3 — VTube Studio parameter injection bundle.
+     *
+     * VTS exposes a parameter injection API that accepts float values on named paths.
+     * Handy maps hand joint rotations to VTS custom parameter names so users can
+     * drive blendshapes, spring bones, or constraints in their VTS avatar.
+     *
+     * VTS parameter paths (sent as individual OSC float messages):
+     *   /VTubeStudioInternal/Hand/Wrist/Yaw|Pitch|Roll
+     *   /VTubeStudioInternal/Hand/<Finger>/<Joint>/<Axis>
+     *
+     * Face expressions (when sendFace=true) use VTS ARKit parameter paths:
+     *   /VTubeStudioInternal/FaceAngle/Yaw|Pitch|Roll
+     *   /VTubeStudioInternal/EyeOpenLeft|Right
+     *   /VTubeStudioInternal/EyeLeftX|Y, EyeRightX|Y
+     */
+    private fun buildBundleVtubeStudio(result: RetargetResult): ByteArray {
+        val buf = ByteBuffer.allocate(2048).order(ByteOrder.BIG_ENDIAN)
+        buf.put(BUNDLE_HEADER)
+
+        val fingerNames = listOf("Thumb", "Index", "Middle", "Ring", "Pinky")
+        val jointNames  = listOf("MCP", "PIP", "DIP")
+
+        // Wrist rotation as YPR floats
+        val wrist = result.jointRotations[BoneRetargeter.JOINT_WRIST] ?: Quaternion.IDENTITY
+        val (wy, wp, wr) = quaternionToVtsYPR(wrist)
+        listOf("Yaw" to wy, "Pitch" to wp, "Roll" to wr).forEach { (axis, v) ->
+            val addr = "/VTubeStudioInternal/Hand/Wrist/$axis"
+            val msg  = buildOscFloat(addr, v)
+            buf.putInt(msg.size); buf.put(msg)
+        }
+
+        // Finger joints — thumb has CMC/MCP/IP; others have MCP/PIP/DIP
+        val fingerJointMap = listOf(
+            listOf(BoneRetargeter.JOINT_THUMB_CMC,  BoneRetargeter.JOINT_THUMB_MCP,  BoneRetargeter.JOINT_THUMB_IP),
+            listOf(BoneRetargeter.JOINT_INDEX_MCP,  BoneRetargeter.JOINT_INDEX_PIP,  BoneRetargeter.JOINT_INDEX_DIP),
+            listOf(BoneRetargeter.JOINT_MIDDLE_MCP, BoneRetargeter.JOINT_MIDDLE_PIP, BoneRetargeter.JOINT_MIDDLE_DIP),
+            listOf(BoneRetargeter.JOINT_RING_MCP,   BoneRetargeter.JOINT_RING_PIP,   BoneRetargeter.JOINT_RING_DIP),
+            listOf(BoneRetargeter.JOINT_PINKY_MCP,  BoneRetargeter.JOINT_PINKY_PIP,  BoneRetargeter.JOINT_PINKY_DIP)
+        )
+        for ((fi, finger) in fingerNames.withIndex()) {
+            for ((ji, jointIdx) in fingerJointMap[fi].withIndex()) {
+                val q = result.jointRotations[jointIdx] ?: Quaternion.IDENTITY
+                val curl = quaternionAngle(q)   // 0 = straight, π = fully bent
+                val addr = "/VTubeStudioInternal/Hand/$finger/${jointNames[ji]}"
+                val msg  = buildOscFloat(addr, curl / Math.PI.toFloat())   // normalise to [0,1]
+                buf.putInt(msg.size); buf.put(msg)
+            }
+        }
+
+        return buf.array().copyOf(buf.position())
+    }
+
+    /** Extract YPR Euler angles from a quaternion (radians, ZXY order). */
+    private fun quaternionToVtsYPR(q: Quaternion): Triple<Float, Float, Float> {
+        val sinP = 2f * (q.w * q.x - q.z * q.y)
+        val pitch = if (kotlin.math.abs(sinP) >= 1f)
+            kotlin.math.PI.toFloat() / 2f * sinP.sign
+        else kotlin.math.asin(sinP)
+        val yaw  = kotlin.math.atan2(2f * (q.w * q.y + q.x * q.z), 1f - 2f * (q.x * q.x + q.y * q.y))
+        val roll = kotlin.math.atan2(2f * (q.w * q.z + q.x * q.y), 1f - 2f * (q.x * q.x + q.z * q.z))
+        return Triple(yaw, pitch, roll)
+    }
+
+    private fun quaternionAngle(q: Quaternion): Float =
+        2f * kotlin.math.acos(q.w.coerceIn(-1f, 1f))
+
+    /**
+     * OSC-1 — Build a VMC bundle from a [FullBodyRetargetResult], including body bones.
+     *
+     * Called from the unified [sendFrame] overload when schema is VMC or VSEEFACE.
+     * Body joints are appended after hand joints using the same /VMC/Ext/Bon/Rot address.
+     * Joints absent from [FullBodyRetargetResult.body] (visibility-gated) are omitted —
+     * the VMC receiver uses T-pose for absent bones.
+     */
+    private fun buildBundleVmcFull(full: FullBodyRetargetResult): ByteArray {
+        val hand = full.handPrimary
+        val body = full.body
+
+        // Estimate buffer: hand joints (16 × ~70b) + body joints (15 × ~70b) + header
+        val buf = ByteBuffer.allocate(3200).order(ByteOrder.BIG_ENDIAN)
+        buf.put(BUNDLE_HEADER)
+
+        val rotAddr = SchemaAddresses.vmcRotAddr
+
+        // ── Hand joints ───────────────────────────────────────────────────────
+        if (hand != null) {
+            for (j in MotionRecorder.HIERARCHY_ORDER) {
+                val q       = hand.jointRotations[j] ?: Quaternion.IDENTITY
+                val boneB   = SchemaAddresses.vmcBoneBytes[j] ?: continue
+                val msgSize = rotAddr.size + TYPE_SFFFF.size + boneB.size + 16
+                buf.putInt(msgSize)
+                buf.put(rotAddr)
+                buf.put(TYPE_SFFFF)
+                buf.put(boneB)
+                buf.putFloat(q.x); buf.putFloat(q.y); buf.putFloat(q.z); buf.putFloat(q.w)
+            }
+            // Wrist root position
+            val pos      = hand.wristTransform.position
+            val wristB   = SchemaAddresses.vmcWristBone
+            val posAddr  = SchemaAddresses.vmcPosAddr
+            val msgSize  = posAddr.size + TYPE_SFFF.size + wristB.size + 12
+            buf.putInt(msgSize)
+            buf.put(posAddr)
+            buf.put(TYPE_SFFF)
+            buf.put(wristB)
+            buf.putFloat(pos.x); buf.putFloat(pos.y); buf.putFloat(pos.z)
+        }
+
+        // ── Body joints (OSC-1) ───────────────────────────────────────────────
+        if (body != null) {
+            for ((joint, q) in body.joints) {
+                val boneB   = SchemaAddresses.vmcBodyBoneBytes[joint] ?: continue
+                val msgSize = rotAddr.size + TYPE_SFFFF.size + boneB.size + 16
+                buf.putInt(msgSize)
+                buf.put(rotAddr)
+                buf.put(TYPE_SFFFF)
+                buf.put(boneB)
+                buf.putFloat(q.x); buf.putFloat(q.y); buf.putFloat(q.z); buf.putFloat(q.w)
+            }
+        }
+
+        return buf.array().copyOf(buf.position())
     }
 
     // ── HANDY_DEFAULT ─────────────────────────────────────────────────────────

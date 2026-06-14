@@ -8,17 +8,16 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.arhand.camera.CameraController
 import com.arhand.camera.CameraFrameProvider
+import com.arhand.camera.BitmapGrayscaleShim
 import com.arhand.depth.ArDepthAvailability
-import com.arhand.depth.ArDepthSession
+import com.arhand.depth.DepthSourceCallback
 import com.arhand.depth.DepthApiCarver
 import com.arhand.depth.DepthCarver
 import com.arhand.depth.HandSegmentationMask
-import com.arhand.depth.MeshSmoother
 import com.arhand.depth.NeuralImplicitCarver
 import com.arhand.depth.ManoShapeFitter
+import com.arhand.depth.fusion.FusedDepthSource
 import com.arhand.export.GLBExporter
-import com.arhand.export.GltfAnimationExporter
-import com.arhand.export.PointCloudExporter
 import com.arhand.render.ARRenderer
 import com.arhand.render.RenderMode
 import com.arhand.scanner.CLAHEAnalyzer
@@ -26,14 +25,20 @@ import com.arhand.scanner.PersonalModelStore
 import com.arhand.scanner.Scanner
 import com.arhand.scanner.PhotometricStereoCapture
 import com.arhand.mocap.AssetLoader
+import com.arhand.mocap.BiomechanicalConstraintFilter
 import com.arhand.mocap.BoneRetargeter
+import com.arhand.mocap.BodyRetargeter
+import com.arhand.mocap.BodyRetargetResult
+import com.arhand.mocap.FullBodyRetargetResult
 import com.arhand.mocap.LoadedAsset
 import com.arhand.mocap.MotionRecorder
 import com.arhand.mocap.OscStreamer
 import com.arhand.mocap.OscSchema
 import com.arhand.mocap.OscMode
 import com.arhand.mocap.OscReceiver
+import com.arhand.mocap.QuaternionEmaFilter
 import com.arhand.mocap.RetargetResult
+import com.arhand.mocap.VrmBlendShapeParser
 import com.arhand.tracking.HandPipeline
 import com.arhand.tracking.HandTrackerManager
 import com.arhand.tracking.HandTracker
@@ -41,8 +46,10 @@ import com.arhand.tracking.HandLandmarks
 import com.arhand.tracking.BodyPipeline
 import com.arhand.tracking.FacePipeline
 import com.arhand.tracking.FullBodyFrame
+import com.arhand.tracking.CompositeGestureClassifier
 import com.arhand.tracking.Gesture
 import com.arhand.util.FrameThrottler
+import com.arhand.util.ModelBudgetManager
 import com.arhand.util.PerfMonitor
 import com.arhand.util.Vec3
 import kotlinx.coroutines.Dispatchers
@@ -56,120 +63,53 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
-import com.arhand.scanner.BiometricHistoryEntry
 import com.arhand.scanner.HandBiometrics
 import com.arhand.render.LiveMeshDeformer
-
-data class AppUiState(
-    val renderMode: RenderMode = RenderMode.MESH,
-    val torchOn: Boolean = true,
-    val showCloud: Boolean = false,
-    val isFrontCamera: Boolean = true,
-    val scanActive: Boolean = false,
-    val exportedGlbPath: String? = null,
-    val hasStoredModel: Boolean = false,
-    val showSplash: Boolean = true,
-    /** E6 — True on first launch until the user completes or skips onboarding. */
-    val showOnboarding: Boolean = false,
-    val depthMode: Boolean = false,
-    /** B6 — true once ArDepthAvailability.isDepthApiSupported() confirms ARCore Depth API support. */
-    val depthApiAvailable: Boolean = false,
-    /** B6 — mean confidence (0..1) of the latest fused ARCore depth point cloud. */
-    val depthConfidence: Float = 0f,
-    /** Biometrics computed after the most recent scan. Null until first scan completes. */
-    val handBiometrics: HandBiometrics? = null,
-    /** D4 — Biometric history list, newest-first, max 20 entries. */
-    val biometricHistory: List<BiometricHistoryEntry> = emptyList(),
-    /** D5 — Joint range-of-motion result from the most recent scan. Null until first scan. */
-    val jointRomData: com.arhand.scanner.JointRomData? = null,
-    /** True while an asset GLB is being loaded from storage. */
-    val assetLoading: Boolean = false,
-    /** Display name of the currently loaded asset, or null for the default puppet. */
-    val loadedAssetName: String? = null,
-    /** True while [MotionRecorder] is actively recording. */
-    val isRecording: Boolean = false,
-    /** Absolute path of the last exported BVH file, or null. */
-    val exportedBvhPath: String? = null,
-    /** Absolute path of the last exported animated GLB file, or null. */
-    val exportedGltfPath: String? = null,
-    /** True while OSC streaming is active. */
-    val isOscStreaming: Boolean = false,
-    /** Current OSC target host (IP or hostname). */
-    val oscHost: String = OscStreamer.DEFAULT_HOST,
-    /** Current OSC target port. */
-    val oscPort: Int = OscStreamer.DEFAULT_PORT,
-    /** Active OSC address schema preset. */
-    val oscSchema: OscSchema = OscSchema.HANDY_DEFAULT,
-    /** True when body pose tracking is active. */
-    val bodyTrackingEnabled: Boolean = false,
-    /** True when face tracking is active. */
-    val faceTrackingEnabled: Boolean = false,
-    /** G3 — OSC operating mode: SEND (broadcast) or RECEIVE (listen). */
-    val oscMode: OscMode = OscMode.SEND,
-    /** G3 — True when OSC receiver is active and listening for remote hand data. */
-    val isOscReceiving: Boolean = false,
-    /** G3 — UDP port the OSC receiver is listening on. */
-    val oscReceivePort: Int = OscReceiver.DEFAULT_PORT,
-    /** G4 — Currently recognized gesture on the primary hand slot, or null. */
-    val activeGesture: Gesture? = null,
-    /**
-     * G1 — True when the live-deforming scanned mesh ("mirror effect") is active.
-     * Requires a completed scan ([hasStoredModel] == true) to have mesh data to deform.
-     */
-    val liveMeshActive: Boolean = false,
-    /**
-     * G2 — True when neural implicit reconstruction is enabled.
-     * When true, [NeuralImplicitCarver] is trained per-scan and used instead of
-     * [DepthCarver] for the final mesh. Falls back to MANO shape-fitted capsule SDF
-     * if the MLP produces an empty result.
-     */
-    val neuralReconEnabled: Boolean = false,
-    /**
-     * G2 — Diagnostics from the last neural reconstruction training pass.
-     * Null until the first neural-enabled scan completes.
-     */
-    val neuralReconDiagnostics: NeuralReconDiagnostics? = null,
-    /**
-     * G5 — True when photometric stereo flash capture is active.
-     * Requires torch availability (rear camera). When enabled during a scan,
-     * the torch is toggled each frame to accumulate lit/unlit pairs and derive
-     * a high-frequency surface normal map.
-     */
-    val photoStereoEnabled: Boolean = false,
-    /**
-     * G5 — Number of lit/unlit frame pairs accumulated during the current (or
-     * most recent) scan. Resets to 0 at scan start. Used to drive a progress
-     * indicator in [DepthScannerPanel].
-     */
-    val photoStereoFrameCount: Int = 0,
-    /**
-     * G5 — True once the photometric stereo capture has accumulated
-     * [PhotometricStereoCapture.TARGET_PAIRS] pairs in the current scan.
-     */
-    val photoStereoComplete: Boolean = false
-)
+import com.arhand.feature.record.TakeEntry
+import com.arhand.feature.scan.NeuralReconDiagnostics
 
 /**
- * G2 — Training diagnostics exposed to the UI.
- * @param trainLoss       Final binary cross-entropy loss after training.
- * @param trainEpochs     Number of epochs trained.
- * @param shapeScale      Per-segment radius multipliers from MANO shape fitting.
- * @param meshVertexCount Number of triangle vertices in the neural mesh.
+ * Gap 5 — A single completed recording take.
+ *
+ * @param label    Human-readable name entered by the user before recording.
+ * @param bvhPath  Absolute path to the exported BVH file, or null if export failed.
+ * @param gltfPath Absolute path to the exported animated GLB, or null.
+ * @param durationMs Recording duration in milliseconds.
+ * @param frameCount Number of frames captured.
  */
-data class NeuralReconDiagnostics(
-    val trainLoss: Float,
-    val trainEpochs: Int,
-    val shapeScale: FloatArray?,
-    val meshVertexCount: Int
+/**
+ * Gap 7 — Top-level workflow mode separating scan, stream, record, and settings.
+ * Determines which controls are shown in the bottom control panel.
+ */
+data class AppUiState(
+    val renderMode:    RenderMode    = RenderMode.MESH,
+    val torchOn:       Boolean       = true,
+    val showCloud:     Boolean       = false,
+    val isFrontCamera: Boolean       = true,
+    val scanActive:    Boolean       = false,
+    val showSplash:    Boolean       = true,
+    val showOnboarding: Boolean      = false,
+    val liveMeshActive: Boolean      = false,
+    val workflowMode:  WorkflowMode  = WorkflowMode.STREAM
 )
+
+// DataStore delegates — must be top-level per Kotlin DataStore contract.
+// One singleton instance per application process regardless of ViewModel lifecycle.
+private val Context.onboardingDataStore: DataStore<Preferences>
+    by preferencesDataStore(name = "handy_onboarding")
+
+private val Context.oefDataStore: DataStore<Preferences>
+    by preferencesDataStore(name = "handy_oef")
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
-    // ─── E6: Onboarding DataStore ─────────────────────────────────────────────
-    private val Context.onboardingDataStore: DataStore<Preferences>
-        by preferencesDataStore(name = "handy_onboarding")
+    // DataStore instances declared at file top level (see below class)
 
     private val KEY_ONBOARDING_SEEN = booleanPreferencesKey("onboarding_seen")
+
+    // ── PERF-2: OEF calibration DataStore keys ───────────────────────────────
+    private val KEY_OEF_CUTOFF = androidx.datastore.preferences.core.floatPreferencesKey("oef_cutoff")
+    private val KEY_OEF_BETA   = androidx.datastore.preferences.core.floatPreferencesKey("oef_beta")
 
     /** Persist dismissal and hide the onboarding screen. */
     fun dismissOnboarding() {
@@ -186,8 +126,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val perfMonitor    = PerfMonitor()
     val handPipeline   = HandPipeline()
     val scanner        = Scanner()
+    /** LIMIT-2 — Continuous freeform scan engine. Runs independently of [scanner]. */
+    val freeformScanner = com.arhand.scanner.FreeformScanner()
     val clahe          = CLAHEAnalyzer()
-    val frameThrottler = FrameThrottler()
+    val frameThrottler = com.arhand.util.FrameThrottler()
+
+    /** Owns body/face/constraint enabled state. Single source of truth. */
+    val trackingManager = com.arhand.feature.tracking.TrackingManager()
+    /** Owns OSC streaming lifecycle, schema, and persistence. */
+    val oscManager = com.arhand.feature.stream.OscManager(getApplication(), oscStreamer, viewModelScope)
+    /** Owns recording lifecycle and take list. */
+    val recordingManager = com.arhand.feature.record.RecordingManager(getApplication(), motionRecorder, viewModelScope)
+    /** Owns loaded asset state and persistence. */
+    val assetManager = com.arhand.feature.asset.AssetManager(getApplication(), viewModelScope)
+    /** Scan-specific state not covered by Scanner.status (settings, results, depth config). */
+    val scanState = MutableStateFlow(com.arhand.feature.scan.ScanState())
+    /** Gap 3 — OSC health state for HUD and settings display. */
+    val oscHealth = oscStreamer.health
+
+    /**
+     * PERF-1 — Multi-model inference budget manager.
+     * Decides each frame whether body and face pipelines should submit inference,
+     * based on combined dispatch time EMA vs. [ModelBudgetManager.FRAME_BUDGET_MS].
+     */
+    private val modelBudget = ModelBudgetManager()
     val modelStore     = PersonalModelStore(app)
 
     /** G5 — Photometric stereo capture engine. */
@@ -211,24 +173,77 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // Captured world-space landmark frames for depth carving — paired with quality scores for B1
     private val capturedFrames = mutableListOf<Pair<List<Vec3>, Float>>()
 
-    // G5 — Snapshot of torchOn at scan start. processScan() runs on Dispatchers.Default
     // and must restore the torch after stereo capture. Reading uiState there risks a
     // stale value if the user toggled torch mid-scan. We capture the ground truth here.
     private var torchOnAtScanStart: Boolean = true
 
-    // B6 — Per-frame fused ARCore depth point clouds (world-space), captured during
     // CAPTURING when depthMode is active. Used by DepthApiCarver instead of the
     // capsule-SDF DepthCarver path.
     private val capturedDepthFrames = mutableListOf<List<Vec3>>()
 
-    // B6 — ARCore Depth API session. Created lazily once availability is confirmed.
-    private var arDepthSession: ArDepthSession? = null
+    /**
+     * R1 — One Bitmap per completed scan pose, captured at pose-completion time.
+     * Used by [GLBExporter] to bake a 512×512 colour atlas as `baseColorTexture`.
+     * Cleared at scan start; populated via [poseCaptureDone] signal.
+     */
+    private val capturedScanBitmaps = mutableListOf<Bitmap>()
+
+    /** R1 — Latest camera bitmap from the frame stream. Written atomically each frame. */
+    @Volatile private var latestBitmap: Bitmap? = null
+     *
+     * Integrates depth point batches during the scan alongside [capturedDepthFrames].
+     * After the scan, [TSDFVolume.extractMesh] produces a directly-meshable surface
+     * via marching cubes — bypassing the [DepthApiCarver] shell-SDF step when TSDF
+     * has accumulated sufficient data (≥ 4 frames).
+     */
+    private val tsdfVolume = com.arhand.depth.TSDFVolume()
+
+    /**
+     * SPATIAL LAYER — persistent depth sensing foundation.
+     *
+     * Replaces the scan-gated [fusedDepth] / [depthShim] pair. Starts with the camera
+     * and runs continuously regardless of scan state or workflow mode. All scan tools
+     * (TSDF, FreeformScanner) read from [spatialLayer].fusedDepth.store; they do not
+     * own the depth session lifecycle.
+     *
+     * [depthMode] in [ScanState] is now repurposed to mean "TSDF accumulation for scan"
+     * (the rendering/export concern), not "depth sensing running" (which is always true).
+     */
+    val spatialLayer = com.arhand.depth.SpatialLayer(getApplication())
+
+    /** Shim that routes Bitmap frames from the running camera to SfM/Photometric. */
+    private val depthShim = BitmapGrayscaleShim()
 
     // Landmark frames paired with quality scores — used for biometrics computation
     private val biometricFrames = mutableListOf<Pair<HandLandmarks, Float>>()
 
     // Latest mesh produced by processScan() — exposed for the 3D viewer
     val depthMeshPositions: MutableStateFlow<FloatArray> = MutableStateFlow(FloatArray(0))
+
+    /**
+     * Hot-path StateFlow: currently recognised gesture on the primary hand.
+     * Updated at inference rate (up to 30fps) — kept out of [AppUiState] so
+     * gesture changes do not trigger full-tree Compose recomposition.
+     * Screens that need gestures collect this directly.
+     */
+    val activeGesture: MutableStateFlow<Gesture?> = MutableStateFlow(null)
+
+    /**
+     * Hot-path StateFlow: ARCore depth cloud confidence (0–1).
+     * Updated each depth frame — kept out of [AppUiState] for the same reason.
+     */
+    val depthConfidence: MutableStateFlow<Float> = MutableStateFlow(0f)
+
+    /**
+     * Hot-path StateFlow: photometric stereo pair count during scan.
+     * Updated each camera frame during active stereo capture.
+     */
+    val photoStereoFrameCount: MutableStateFlow<Int> = MutableStateFlow(0)
+
+    /**
+     * Hot-path StateFlow: true once [PhotometricStereoCapture.TARGET_PAIRS] reached.
+     */
+    val photoStereoComplete: MutableStateFlow<Boolean> = MutableStateFlow(false)
 
     // ── G1 — Live mesh deformation ────────────────────────────────────────
     /**
@@ -246,15 +261,40 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ── Mocap state ────────────────────────────────────────────────────────
     /** Currently loaded asset. Starts as the default puppet (no mesh, symmetric bind pose). */
-    private var loadedAsset: LoadedAsset = AssetLoader.DEFAULT_PUPPET
+    /** ARCH-3 — Exposed for [ModelViewerScreen] live character animation. */
+    /**
+     * Mirror of [assetManager.loadedAsset] kept for synchronous GL-thread access.
+     * Updated via collect reactor in init — do not write directly.
+     * External readers should prefer [assetManager.loadedAsset] StateFlow.
+     */
+    internal var loadedAsset: LoadedAsset = AssetLoader.DEFAULT_PUPPET
+        private set
 
     /** Retargeter instance — rebuilt whenever [loadedAsset] changes. */
     private var boneRetargeter: BoneRetargeter = BoneRetargeter(AssetLoader.DEFAULT_PUPPET.bindPose)
 
+    /** Gap 2 — Secondary hand (slot 1 = left hand) retargeter and smoother. */
+    private var boneRetargeterSecondary: BoneRetargeter = BoneRetargeter(AssetLoader.DEFAULT_PUPPET.bindPose)
+    private val quaternionEmaFilterSecondary = QuaternionEmaFilter()
+
     /** Most recent retarget result — updated every tracking frame. Null until first frame. */
     val latestRetargetResult: MutableStateFlow<RetargetResult?> = MutableStateFlow(null)
 
-    /** Motion recorder — buffers joint rotations for BVH export. */
+    /** IMP-1 — Speed-adaptive quaternion EMA filter applied after retargeting. */
+    private val quaternionEmaFilter = QuaternionEmaFilter()
+
+    /**
+     * HAND-6 — Shared [NeuralImplicitCarver] instance for incremental training during scan.
+     *
+     * Created at scan start; trained incrementally after each pose via [poseCaptureDone].
+     * When [processScan] runs, it calls [NeuralImplicitCarver.trainIncremental] with the
+     * remaining poses on top of the already-trained weights — total compute budget is the
+     * same as full training, but partial scans produce progressively better meshes.
+     */
+    private var incrementalCarver: com.arhand.depth.NeuralImplicitCarver? = null
+
+    /** Background job running incremental training. Cancelled if scan is cancelled. */
+    private var incrementalTrainJob: kotlinx.coroutines.Job? = null
     val motionRecorder = MotionRecorder()
 
     /** OSC streamer — broadcasts live joint rotations over UDP. */
@@ -266,6 +306,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Body pose pipeline — disabled until [enableBodyTracking] is called. */
     val bodyPipeline = BodyPipeline()
 
+    /**
+     * BODY-1 — Converts [BodyPipeline] landmarks into joint rotations.
+     * Single instance; reset() called when body tracking is disabled.
+     */
+    private val bodyRetargeter = BodyRetargeter()
+
+    /**
+     * BODY-1 — Most recent body retarget result. Null until body tracking is enabled
+     * and the first frame is processed. Published each hand-pipeline frame when body
+     * tracking is active, consumed by OSC streamer and SkinnedMeshRenderer (future sprints).
+     */
+    val latestBodyRetargetResult: MutableStateFlow<BodyRetargetResult?> = MutableStateFlow(null)
+
+    /**
+     * ARCH-1 — Most recent unified full-body frame. Assembles hand + body + face into
+     * one structure per frame. Null until the first hand frame is processed.
+     * Consumed by OSC, MotionRecorder, and future GltfAnimationExporter.
+     */
+    val latestFullBodyRetargetResult: MutableStateFlow<FullBodyRetargetResult?> = MutableStateFlow(null)
+
     /** Face landmark pipeline — disabled until [enableFaceTracking] is called. */
     val facePipeline = FacePipeline()
 
@@ -273,17 +333,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val latestFullBodyFrame: MutableStateFlow<FullBodyFrame?> = MutableStateFlow(null)
 
     init {
-        // B6 — Check ARCore Depth API availability (off main thread; Session creation
-        // can take tens of milliseconds). Only affects whether DepthScannerPanel offers
-        // the toggle — the capsule-SDF DepthCarver path remains the default/fallback.
+
+        // Fused depth is always available — SfM works on any device with a camera.
+        // depthApiAvailable now reflects whether ARCore HW depth is present (for
+        // UI labelling only — the button is always shown).
         viewModelScope.launch(Dispatchers.IO) {
-            val available = ArDepthAvailability.isDepthApiSupported(getApplication())
+            val arcoreDepthPresent = ArDepthAvailability.isDepthApiSupported(getApplication())
             withContext(Dispatchers.Main) {
-                uiState.update { it.copy(depthApiAvailable = available) }
+                scanState.value = scanState.value.copy(depthApiAvailable = true, arcoreDepthHw = arcoreDepthPresent)
             }
         }
 
-        // E6 — Check if onboarding has been seen; show it on first launch
         viewModelScope.launch(Dispatchers.IO) {
             val prefs = getApplication<Application>().onboardingDataStore.data.first()
             val seen  = prefs[KEY_ONBOARDING_SEEN] ?: false
@@ -294,26 +354,39 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        // Publish aspect changes from the GL thread into currentAspect
+        // ASSET-1 — Restore last loaded asset URI on cold start.
+        // AssetManager restores last-used asset in its own init block.
+        // OscManager restores saved host/port/schema in its own init block.
+        // BundledAssetGenerator is called from AssetManager.init.
+
+        // PERF-2 — Restore OEF calibration on cold start
+        viewModelScope.launch(Dispatchers.IO) {
+            val prefs = getApplication<Application>().oefDataStore.data.first()
+            val cutoff = prefs[KEY_OEF_CUTOFF]
+            val beta   = prefs[KEY_OEF_BETA]
+            if (cutoff != null && beta != null) handPipeline.setOefParams(cutoff, beta)
+        }
         renderer.onAspectChanged = { aspect ->
             currentAspect.value = aspect
         }
 
-        // B6 — Wire ARCore depth session lifecycle to the GL thread.
-        // setCameraTextureName must be called once after EGL context creation.
-        renderer.onGlSurfaceCreated = { textureId ->
-            arDepthSession?.setCameraTextureName(textureId)
-        }
-        // Session.update() must be called from onDrawFrame. We call it here only
-        // when depth mode is active to avoid ARCore overhead when unused.
-        renderer.onDepthFrameTick = {
-            val session = arDepthSession
-            if (session != null && uiState.value.depthMode) {
-                try {
-                    val frame = session.session?.update()
-                    if (frame != null) session.update(frame)
-                } catch (_: Throwable) {}
+        // React to AssetManager asset changes — update retargeter bind pose and renderer.
+        // This replaces the old inline logic in loadAsset/loadBundledAsset.
+        viewModelScope.launch {
+            assetManager.loadedAsset.collect { asset ->
+                loadedAsset = asset
+                boneRetargeter          = BoneRetargeter(asset.bindPose)
+                boneRetargeterSecondary = BoneRetargeter(asset.bindPose)
+                renderer.loadedAsset    = if (asset == AssetLoader.DEFAULT_PUPPET) null else asset
             }
+        }
+
+        // Wire spatialLayer to GL thread (required by ARCore's EGL contract).
+        renderer.onGlSurfaceCreated = { textureId ->
+            spatialLayer.setCameraTextureName(textureId)
+        }
+        renderer.onDepthFrameTick = {
+            spatialLayer.onDrawFrame()
         }
 
         // Wire tracking results → pipeline
@@ -325,29 +398,155 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // Retarget the primary hand onto the loaded asset each frame
                 val primary = hands.firstOrNull()
                 primary?.let { hand ->
+                    // BODY-3 — Provide body wrist hint when body tracking is active
+                    val bodyResult   = latestBodyRetargetResult.value
+                    val isMirror     = uiState.value.isFrontCamera
+                    val bodyWristPos = if (trackingManager.state.value.bodyEnabled && bodyResult != null)
+                        if (hand.slotIndex == 1) bodyResult.wristLeft else bodyResult.wristRight
+                    else null
+                    val bodyWristVis = bodyResult?.confidence ?: 0f
+
                     val result = boneRetargeter.retarget(
-                        lms     = hand.landmarks,
-                        aspect  = currentAspect.value,
-                        mirrorX = uiState.value.isFrontCamera
+                        lms           = hand.landmarks,
+                        aspect        = currentAspect.value,
+                        mirrorX       = isMirror,
+                        bodyWristHint = bodyWristPos,
+                        bodyWristVis  = bodyWristVis
                     )
                     if (result != null) {
-                        latestRetargetResult.value    = result
-                        renderer.latestRetargetResult = result  // forward to GL thread
-                        motionRecorder.pushFrame(result)        // record if active
-                        oscStreamer.sendFrame(result)           // stream if active
 
-                        // G1 — Live mesh deformation: deform on tracking thread, push to GL thread
+                        val smoothedResult = quaternionEmaFilter.apply(result)
+
+                        // HAND-1 — Apply biomechanical joint constraints when enabled.
+                        // Projects rotations into anatomically feasible ROM ranges.
+                        // Off by default; enabled via Settings toggle.
+                        val constrainedResult = if (trackingManager.state.value.constraintEnabled) {
+                            BiomechanicalConstraintFilter.apply(smoothedResult)
+                        } else {
+                            smoothedResult
+                        }
+
+                        // Gap 6 — Unified world coordinates.
+                        // When body tracking is active, anchor the hand wrist position to the
+                        // body-space wrist landmark so hand and body skeleton share one coordinate
+                        // system. Without this, the hand floats in camera-normalised space
+                        // independently of the body's metric world space.
+                        val worldAlignedResult = if (trackingManager.state.value.bodyEnabled &&
+                            bodyResult != null && bodyResult.confidence > 0.5f) {
+                            val bodyWrist = if (hand.slotIndex == 1)
+                                bodyResult.wristLeft else bodyResult.wristRight
+                            if (bodyWrist != null) {
+                                // Replace wrist position with body-space metric position
+                                val alignedTransform = constrainedResult.wristTransform.copy(
+                                    position = bodyWrist
+                                )
+                                constrainedResult.copy(wristTransform = alignedTransform)
+                            } else constrainedResult
+                        } else constrainedResult
+
+                        latestRetargetResult.value    = worldAlignedResult
+                        renderer.latestRetargetResult = worldAlignedResult
+
+                        // Gap 4 — Drive loaded character body skeleton from body retarget result.
+                        if (trackingManager.state.value.bodyEnabled) {
+                            renderer.updateBodyPose(latestBodyRetargetResult.value, loadedAsset)
+                        }
+
+                        // ARCH-4 — Update per-pipeline quality metrics for HUD display
+                        val bodyConf = latestBodyRetargetResult.value?.confidence ?: 0f
+                        val faceConf = if (trackingManager.state.value.faceEnabled) 1f else 0f
+                        perfMonitor.updateQuality(
+                            hand = worldAlignedResult.wristTransform.let { 1f },  // hand always tracked when result is non-null
+                            body = bodyConf,
+                            face = faceConf
+                        )
+
+                        // ARCH-1 — Assemble unified full-body frame and distribute to all consumers.
+                        val faceExpr   = facePipeline.expressions.value
+                            .takeIf { trackingManager.state.value.faceEnabled }
+                    // Gap 2 — Retarget secondary hand (slot 1 = left hand)
+                    val secondary = hands.firstOrNull { it.slotIndex == 1 }
+                    val secondaryResult: RetargetResult? = secondary?.let { secHand ->
+                        val secBodyWrist = if (trackingManager.state.value.bodyEnabled && bodyResult != null)
+                            bodyResult.wristLeft else null
+                        val secRaw = boneRetargeterSecondary.retarget(
+                            lms           = secHand.landmarks,
+                            aspect        = currentAspect.value,
+                            mirrorX       = uiState.value.isFrontCamera,
+                            bodyWristHint = secBodyWrist,
+                            bodyWristVis  = bodyResult?.confidence ?: 0f
+                        )
+                        secRaw?.let { r ->
+                            val smoothed = quaternionEmaFilterSecondary.apply(r)
+                            if (trackingManager.state.value.constraintEnabled)
+                                BiomechanicalConstraintFilter.apply(smoothed)
+                            else smoothed
+                        }
+                    }
+
+                        val fullFrame = FullBodyRetargetResult(
+                            timestamp       = System.currentTimeMillis(),
+                            handPrimary     = worldAlignedResult,
+                            handSecondary   = secondaryResult,
+                            body            = bodyResult.takeIf { trackingManager.state.value.bodyEnabled },
+                            face            = faceExpr,
+                            frameConfidence = worldAlignedResult.wristTransform.let { 1f },
+                            // Spatial layer — always-on depth sensing fields
+                            metricGrounded  = spatialLayer.state.value.isGrounded,
+                            cameraWorldX    = spatialLayer.state.value.cameraWorldX,
+                            cameraWorldY    = spatialLayer.state.value.cameraWorldY,
+                            cameraWorldZ    = spatialLayer.state.value.cameraWorldZ,
+                            depthConfidence = spatialLayer.state.value.depthConfidence
+                        )
+                        latestFullBodyRetargetResult.value = fullFrame
+
+                        // FACE-1 — Apply VRM blend shapes driven by face expressions.
+                        // Resolves FaceExpressions → morph target weights and forwards to renderer.
+                        // applyMorphWeights() is currently a stub; weights will be applied to GPU
+                        // morph buffers once the shader extension is added.
+                        if (trackingManager.state.value.faceEnabled && faceExpr != null) {
+                            val blendMap = loadedAsset.blendShapeMap
+                            if (blendMap != null) {
+                                val morphApps = VrmBlendShapeParser.resolve(faceExpr, blendMap)
+                                renderer.applyMorphWeights(morphApps)
+                            }
+                        }
+
+                        // Distribute via unified paths — existing individual paths kept for
+                        // backward compatibility until OSC-1 / ARCH-2 complete the migration.
+                        motionRecorder.pushFrame(fullFrame)
+                        oscStreamer.sendFrame(fullFrame)
+
+                        if (oscStreamer.sendVelocity) {
+                            oscStreamer.sendVelocityFrame(quaternionEmaFilter.lastAngularVelocity)
+                        }
+
                         if (uiState.value.liveMeshActive && liveMeshDeformer.hasMesh()) {
-                            val deformed = liveMeshDeformer.deform(result)
+                            val deformed = liveMeshDeformer.deform(worldAlignedResult)
                             renderer.liveMeshPositions = deformed
                         }
                     }
+                } ?: run {
+
+                    // prev[] entries don't lerp from the old pose when the hand reappears.
+                    // HandPipeline already resets its own OEF/OcclusionEngine/segConstraint
+                    // on the same event; this keeps AppViewModel's layer in sync.
+                    quaternionEmaFilter.reset()
                 }
 
                 // Feed scanner if active — use real device aspect
                 if (uiState.value.scanActive) {
                     val aspect  = currentAspect.value
-                    scanner.update(primary?.landmarks, clahe.lastContrastScore, System.currentTimeMillis(), aspect, uiState.value.isFrontCamera)
+                    scanner.update(
+                        lms             = primary?.landmarks,
+                        claheContrast   = clahe.lastContrastScore,
+                        nowMs           = System.currentTimeMillis(),
+                        aspect          = aspect,
+                        mirrorX         = uiState.value.isFrontCamera,
+                        faceExpressions = facePipeline.expressions.value.takeIf { trackingManager.state.value.faceEnabled },
+                        // BODY-5 — pass body landmarks for stability gating when active
+                        bodyLandmarks   = bodyPipeline.processed.value.takeIf { trackingManager.state.value.bodyEnabled }
+                    )
 
                     // Capture frames for depth carving — B1: store quality score per frame
                     // Only accumulate during CAPTURING; PREFLIGHT/COUNTDOWN frames have quality=0f
@@ -364,20 +563,82 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                     biometricFrames.add(Pair(lms, quality))
                                 }
 
-                                // B6 — When depth mode is active, also capture the latest
-                                // fused ARCore depth point cloud for this frame.
-                                if (uiState.value.depthMode) {
-                                    val session = arDepthSession
-                                    val cloud = session?.depthPointCloud
-                                    if (!cloud.isNullOrEmpty()) {
-                                        // B7 — discard background points outside the hand's
-                                        // convex hull (cheap segmentation mask).
-                                        val hull = HandSegmentationMask.buildHull(
-                                            lms, aspect, mirrorX = uiState.value.isFrontCamera
-                                        )
-                                        val masked = HandSegmentationMask.filterPointCloud(cloud, hull)
-                                        capturedDepthFrames.add(masked)
-                                        uiState.update { it.copy(depthConfidence = session.depthConfidence) }
+                                // Fused depth — snapshot from all active sources (ARCore + SfM + Photo)
+                                if (scanState.value.depthMode) {
+                                    val fused = spatialLayer.fusedDepth
+                                    if (fused != null) {
+                                        val store = fused.store
+                                        val needed = store.snapshot()
+                                        if (needed >= 4) {
+                                            val buf = FloatArray(needed)
+                                            store.snapshot(buf)
+                                            val cloud = ArrayList<com.arhand.util.Vec3>(needed / 4)
+                                            var bi = 0
+                                            while (bi + 3 < needed) {
+                                                cloud.add(com.arhand.util.Vec3(buf[bi], buf[bi+1], buf[bi+2]))
+                                                bi += 4
+                                            }
+                                            val hull = HandSegmentationMask.buildHull(
+                                                lms, aspect, mirrorX = uiState.value.isFrontCamera
+                                            )
+                                            val masked = HandSegmentationMask.filterPointCloud(cloud, hull)
+                                            capturedDepthFrames.add(masked)
+                                            // HAND-8 — Integrate into TSDF volume for surface-aware reconstruction
+                                            val depthConf = (store.pointCount / 10000f).coerceIn(0.3f, 1f)
+                                            tsdfVolume.integrate(masked, depthConf)
+                                            depthConfidence.value = (store.pointCount / 10000f).coerceIn(0f, 1f)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // LIMIT-2 — Feed freeform scanner when it is the active scan mode
+                    if (scanState.value.freeformActive) {
+                        val worldFrames = primary?.landmarks?.let { lms ->
+                            if (lms.size == 21)
+                                com.arhand.depth.DepthCarver.landmarksToWorld(
+                                    lms, aspect, mirrorX = uiState.value.isFrontCamera
+                                )
+                            else null
+                        }
+                        freeformScanner.update(
+                            lms           = primary?.landmarks,
+                            claheContrast = clahe.lastContrastScore,
+                            bitmap        = latestBitmap,
+                            worldFrames   = worldFrames,
+                            aspect        = aspect,
+                            mirrorX       = uiState.value.isFrontCamera,
+                            nowMs         = System.currentTimeMillis()
+                        )
+
+                        // Depth integration for freeform — same ARCore/SfM path as posed scan
+                        if (scanState.value.depthMode) {
+                            primary?.landmarks?.let { lms ->
+                                if (lms.size == 21) {
+                                    val fused = spatialLayer.fusedDepth
+                                    if (fused != null) {
+                                        val store = fused.store
+                                        val needed = store.snapshot()
+                                        if (needed >= 4) {
+                                            val buf = FloatArray(needed)
+                                            store.snapshot(buf)
+                                            val cloud = ArrayList<com.arhand.util.Vec3>(needed / 4)
+                                            var bi = 0
+                                            while (bi + 3 < needed) {
+                                                cloud.add(com.arhand.util.Vec3(buf[bi], buf[bi+1], buf[bi+2]))
+                                                bi += 4
+                                            }
+                                            val hull = HandSegmentationMask.buildHull(
+                                                lms, aspect, mirrorX = uiState.value.isFrontCamera
+                                            )
+                                            val masked = HandSegmentationMask.filterPointCloud(cloud, hull)
+                                            capturedDepthFrames.add(masked)
+                                            val depthConf = (store.pointCount / 10000f).coerceIn(0.3f, 1f)
+                                            tsdfVolume.integrate(masked, depthConf)
+                                            depthConfidence.value = (store.pointCount / 10000f).coerceIn(0f, 1f)
+                                        }
                                     }
                                 }
                             }
@@ -397,9 +658,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
+        // LIMIT-2 — Watch freeform scanner state → trigger processing when complete
+        viewModelScope.launch {
+            freeformScanner.status.collect { fs ->
+                scanState.value = scanState.value.copy(freeformStatus = fs)
+                when (fs.state) {
+                    com.arhand.scanner.FreeformScanner.State.COMPLETE -> processFreeformScan()
+                    com.arhand.scanner.FreeformScanner.State.FAILED   -> {
+                        uiState.update { it.copy(scanActive = false) }
+                        scanState.value = scanState.value.copy(freeformActive = false)
+                    }
+                    else -> {}
+                }
+            }
+        }
+
         viewModelScope.launch {
             val history = modelStore.loadHistory()
-            uiState.value = uiState.value.copy(
+            scanState.value = scanState.value.copy(
                 hasStoredModel   = modelStore.hasModel(),
                 biometricHistory = history
             )
@@ -409,13 +685,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun initCamera() {
         cameraController = CameraController(getApplication(), frameProvider)
         handTrackerManager = HandTrackerManager(getApplication()) { rawHands, conf, timestamp ->
-            handPipeline.update(rawHands, conf, timestamp)
+            handPipeline.update(rawHands, conf, timestamp, mirrorX = uiState.value.isFrontCamera)
         }
         handTrackerManager!!.init()
 
+        // Start spatial layer immediately — always-on depth sensing from first camera frame.
+        // The GL texture ID will be set when onGlSurfaceCreated fires; spatialLayer handles
+        // the case where start() is called before the texture is available.
+        spatialLayer.start(depthShim, texId = renderer.lastArCameraTextureId)
+
+        // Mirror spatialLayer confidence into the existing depthConfidence StateFlow
+        // so existing UI consumers (DepthScannerPanel, HUD) work without changes.
+        viewModelScope.launch {
+            spatialLayer.state.collect { s ->
+                depthConfidence.value = s.depthConfidence
+            }
+        }
+
         // Wire frame provider → renderer passthrough + CLAHE + tracker
         viewModelScope.launch(Dispatchers.Default) {
-            // G5 — lastStereoLit tracks the torch state that was active when the
+
             // *previous* frame was captured. The camera pipeline has 1–3 frames of
             // latency, so the bitmap we receive NOW was captured under the torch state
             // we set LAST frame. We tag accordingly, then toggle for the next frame.
@@ -424,12 +713,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             var inStereoMode  = false   // tracks whether stereo was active last frame
 
             frameProvider.frames.collect { bitmap ->
+                latestBitmap = bitmap   // R1 — snapshot for pose bitmap capture
                 renderer.submitCameraFrame(bitmap)
 
-                // G5 — Photometric stereo: tag current frame with the torch state that
+                // Always feed the depth shim — SpatialLayer runs continuously.
+                // Previously gated on scanState.depthMode; now unconditional.
+                depthShim.onBitmap(bitmap, System.currentTimeMillis())
+
                 // was active when it was captured (lastStereoLit), then toggle torch for
                 // the next frame.
-                val stereoCondition = uiState.value.photoStereoEnabled &&
+                val stereoCondition = scanState.value.photoStereoEnabled &&
                     uiState.value.scanActive &&
                     !uiState.value.isFrontCamera &&
                     photoStereoCapture.isActive
@@ -452,11 +745,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     // Sync progress to UI (cheap — only updates when count changes)
                     val pairs    = photoStereoCapture.frameCount
                     val complete = photoStereoCapture.isComplete
-                    if (pairs != uiState.value.photoStereoFrameCount || complete != uiState.value.photoStereoComplete) {
-                        uiState.update { it.copy(
-                            photoStereoFrameCount = pairs,
-                            photoStereoComplete   = complete
-                        ) }
+                    if (pairs != photoStereoFrameCount.value || complete != photoStereoComplete.value) {
+                        photoStereoFrameCount.value = pairs
+                        photoStereoComplete.value = complete
                         // When complete, stop torch pulsing and restore user's torch preference
                         if (complete) {
                             photoStereoCapture.stop()
@@ -471,22 +762,56 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
 
+                val nowMs = System.currentTimeMillis()
                 if (frameThrottler.shouldInfer()) {
-                    val t0 = System.currentTimeMillis()
-                    clahe.process(bitmap)   // updates clahe.lastContrastScore; return value unused
+                    val t0 = nowMs
+                    clahe.process(bitmap)
                     val ts = System.currentTimeMillis()
+
+                    // Hand inference — always submitted on throttled frames
+                    val tHand0 = System.currentTimeMillis()
                     handTrackerManager!!.detect(bitmap, ts)
+                    val handDispatchMs = (System.currentTimeMillis() - tHand0).toFloat()
 
-                    // Feed body and face pipelines with the same bitmap if enabled.
-                    // All three landmarkers run asynchronously — no extra latency on
-                    // the frame dispatch thread (GPU delegate queues work in parallel).
-                    if (uiState.value.bodyTrackingEnabled) bodyPipeline.detect(bitmap, ts)
-                    if (uiState.value.faceTrackingEnabled) facePipeline.detect(bitmap, ts)
+                    // PERF-1 — Budget-managed body and face submission.
+                    // ModelBudgetManager decides whether to submit each model this frame
+                    // based on combined dispatch EMA vs. the frame budget.
+                    val bodyActive = trackingManager.state.value.bodyEnabled
+                    val faceActive = trackingManager.state.value.faceEnabled
+                    val decision   = modelBudget.tick(bodyActive, faceActive)
 
-                    // dispatchMs = CLAHE + async-submit cost (does not include GPU inference time,
-                    // which arrives via the result callback). Used only for throttle rate tuning.
-                    val dispatchMs = (System.currentTimeMillis() - t0).toFloat()
-                    frameThrottler.reportInferenceMs(dispatchMs)
+                    var bodyDispatchMs = 0f
+                    var faceDispatchMs = 0f
+
+                    if (decision.submitBody) {
+                        val tb = System.currentTimeMillis()
+                        bodyPipeline.detect(bitmap, ts)
+                        bodyDispatchMs = (System.currentTimeMillis() - tb).toFloat()
+                    }
+                    if (decision.submitFace) {
+                        val tf = System.currentTimeMillis()
+                        facePipeline.detect(bitmap, ts)
+                        faceDispatchMs = (System.currentTimeMillis() - tf).toFloat()
+                    }
+
+                    modelBudget.reportDispatch(handDispatchMs, bodyDispatchMs, faceDispatchMs)
+
+                    val totalDispatchMs = (System.currentTimeMillis() - t0).toFloat()
+
+                    // ARCH-4 — Report budget state to PerfMonitor for HUD display
+                    perfMonitor.updateBudget(
+                        activeModels    = decision.activeModelCount,
+                        totalDispatchMs = totalDispatchMs,
+                        bodyThrottled   = decision.bodyThrottled,
+                        faceThrottled   = decision.faceThrottled
+                    )
+
+                    frameThrottler.reportInferenceMs(totalDispatchMs, handPipeline.motionMag.value, HandPipeline.MOTION_GATE_THRESHOLD)
+                } else {
+                    // Skip frame — no inference this frame. Project active landmarks forward
+                    // using their last known velocity so the hand keeps moving on screen
+                    // rather than freezing until the next inference fires.
+                    handPipeline.predictSkipFrame(nowMs)
                 }
             }
         }
@@ -496,7 +821,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // collector (and writing latestFullBodyFrame) on every hand frame when both are off.
         // See enableBodyTracking() / enableFaceTracking() below.
 
-        // G4 — Collect gesture recognitions from primary hand slot and:
         //   1. Update AppUiState.activeGesture for HUD display.
         //   2. Dispatch built-in shortcuts on gesture change (edge-triggered).
         viewModelScope.launch {
@@ -505,7 +829,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val primary = gestureList.getOrNull(0)
                 // Update state whenever gesture changes (including null)
                 if (primary != lastGesture) {
-                    uiState.update { it.copy(activeGesture = primary) }
+                    activeGesture.value = primary
                     // Fire shortcut on newly recognized gesture (not on null)
                     if (primary != null) dispatchGestureShortcut(primary)
                     lastGesture = primary
@@ -543,7 +867,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * positions to [ARRenderer.liveMeshPositions] every frame.
      */
     fun toggleLiveMesh() {
-        if (!uiState.value.hasStoredModel) return
+        if (!(assetManager.state.value.name != null)) return
         val nowActive = !uiState.value.liveMeshActive
 
         if (nowActive) {
@@ -575,7 +899,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * next [processScan] invocation.
      */
     fun toggleNeuralRecon() {
-        uiState.update { it.copy(neuralReconEnabled = !it.neuralReconEnabled) }
+        scanState.value = scanState.value.copy(neuralReconEnabled = !scanState.value.neuralReconEnabled)
+    }
+
+    /**
+     * HAND-1 — Toggle [BiomechanicalConstraintFilter] on/off.
+     *
+     * When enabled, joint rotations are projected into anatomically feasible ROM ranges
+     * after [QuaternionEmaFilter]. Eliminates hyperextension and other impossible poses.
+     * Off by default — enable via Settings or the debug HUD.
+     */
+    fun toggleConstraint() {
+        trackingManager.toggleConstraint()
+    }
     }
 
     /**
@@ -591,7 +927,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun togglePhotoStereo() {
         if (uiState.value.isFrontCamera) return
-        uiState.update { it.copy(photoStereoEnabled = !it.photoStereoEnabled) }
+        scanState.value = scanState.value.copy(photoStereoEnabled = !scanState.value.photoStereoEnabled)
     }
 
     /** G5 — Most recent photometric normal map. Null until the first stereo-enabled scan. */
@@ -614,6 +950,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun switchCamera() {
+        // SpatialLayer SfM/Photo need the rear camera — pause TSDF accumulation but
+        // spatialLayer itself continues (ARCore also requires rear camera so it will
+        // drop to SfM-only on front camera, which is the correct degradation).
+        if (scanState.value.depthMode) {
+            scanState.value = scanState.value.copy(depthMode = false)
+            depthConfidence.value = 0f
+            capturedDepthFrames.clear()
+        }
+        // PERF-1 — Reset budget EMA on camera switch: dispatch times differ
+        // between front and rear cameras (resolution, pipeline differences).
+        modelBudget.reset()
         cameraController.switchCamera()
         val nowFront = cameraController.isFrontFacing()
         // Front camera has no torch — turn it off physically and sync UI state.
@@ -627,27 +974,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * B6 — Toggle ARCore Depth API mode. Only meaningful when
-     * [AppUiState.depthApiAvailable] is true (gated per [ArDepthAvailability]).
-     * Lazily creates/tears down the [ArDepthSession] so it isn't held when unused.
+     * Toggle TSDF accumulation for scan reconstruction.
+     *
+     * [SpatialLayer] now runs continuously — this toggle no longer starts/stops depth
+     * sensing. It controls whether the scan frame loop accumulates depth frames into the
+     * TSDF volume (for mesh export), and whether the depth cloud is shown in the renderer.
+     *
+     * Front camera is still blocked because TSDF accumulation from SfM/ARCore needs
+     * the rear camera's metric point cloud.
      */
     fun toggleDepth() {
-        if (!uiState.value.depthApiAvailable) return
-        val next = !uiState.value.depthMode
+        if (uiState.value.isFrontCamera) return  // TSDF accumulation requires rear camera
+        val next = !scanState.value.depthMode
         if (next) {
-            val session = arDepthSession ?: ArDepthSession(getApplication()).also { arDepthSession = it }
-            if (session.tryCreate()) {
-                // B6 — If the GL surface is already up, setCameraTextureName immediately.
-                // If the surface hasn't been created yet, onGlSurfaceCreated will call it.
-                val texId = renderer.lastArCameraTextureId
-                if (texId != 0) session.setCameraTextureName(texId)
-                session.resume()
-                uiState.update { it.copy(depthMode = true) }
-            }
-            // If session creation fails, leave depthMode off — capsule-SDF path remains active.
+            // Clear stale depth frames from any prior session
+            capturedDepthFrames.clear()
+            scanState.value = scanState.value.copy(depthMode = true)
         } else {
-            arDepthSession?.pause()
-            uiState.update { it.copy(depthMode = false, depthConfidence = 0f) }
+            scanState.value = scanState.value.copy(depthMode = false)
             capturedDepthFrames.clear()
         }
     }
@@ -656,202 +1000,313 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         capturedFrames.clear()
         biometricFrames.clear()
         capturedDepthFrames.clear()
-        // G5 — reset stereo capture and start only if enabled
+        capturedScanBitmaps.clear()   // R1
+        tsdfVolume.reset()
+
         torchOnAtScanStart = uiState.value.torchOn
         photoStereoCapture.reset()
-        if (uiState.value.photoStereoEnabled) photoStereoCapture.start()
-        uiState.update {
-            it.copy(
-                scanActive            = true,
-                photoStereoFrameCount = 0,
-                photoStereoComplete   = false
-            )
+        if (scanState.value.photoStereoEnabled) photoStereoCapture.start()
+        photoStereoFrameCount.value = 0
+        photoStereoComplete.value   = false
+        uiState.update { it.copy(scanActive = true) }
+
+        // HAND-6 — Reset the incremental carver and start collecting pose-done signals.
+        // Training begins after pose index 2 (the 3rd completed pose) — enough data
+        // for a coarse network, and early enough to be useful for partial scans.
+        if (scanState.value.neuralReconEnabled) {
+            val carver = com.arhand.depth.NeuralImplicitCarver()
+            incrementalCarver = carver
+            incrementalTrainJob?.cancel()
+            incrementalTrainJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                scanner.poseCaptureDone.collect { poseIdx ->
+                    // R1 — Snapshot the current camera frame for texture baking.
+                    // Bitmap.copy() is thread-safe on read; the copy is immutable.
+                    latestBitmap?.let { bmp ->
+                        val copy = bmp.copy(bmp.config ?: Bitmap.Config.ARGB_8888, false)
+                        synchronized(capturedScanBitmaps) { capturedScanBitmaps.add(copy) }
+                    }
+
+                    if (poseIdx < 2) return@collect   // wait for at least 3 poses
+                    // Snapshot the frames captured so far for this incremental pass
+                    val frameSnapshot = synchronized(capturedFrames) { capturedFrames.toList() }
+                    val normalMap     = photoStereoNormalMap.value
+                    carver.trainIncremental(frameSnapshot, normalMap = normalMap)
+                }
+            }
         }
+
         scanner.start()
     }
 
     fun cancelScan() {
+        incrementalTrainJob?.cancel()
+        incrementalTrainJob = null
+        incrementalCarver   = null
         scanner.reset()
         capturedFrames.clear()
         biometricFrames.clear()
         capturedDepthFrames.clear()
+        capturedScanBitmaps.clear()   // R1
         photoStereoCapture.stop()
-        // G5 — restore torch to the state it was in when the scan started
-        if (uiState.value.photoStereoEnabled && !uiState.value.isFrontCamera) {
+
+        if (scanState.value.photoStereoEnabled && !uiState.value.isFrontCamera) {
             cameraController.torchController.setTorch(torchOnAtScanStart)
         }
         uiState.update { it.copy(scanActive = false) }
     }
-    private fun processScan() {
-        // Snapshot all mutable frame buffers on the calling thread before handing
-        // off to the background coroutine. A rapid re-scan (user taps RE-SCAN while
-        // processing is still running) calls startScan() which clears these lists —
-        // snapshots ensure the in-flight coroutine works on a stable copy.
-        val cloudPointsSnapshot      = scanner.cloudPoints.toList()
-        val capturedFramesSnapshot   = capturedFrames.toList()
-        val biometricFramesSnapshot  = biometricFrames.toList()
-        val capturedDepthSnapshot    = capturedDepthFrames.toList()
+
+    // ─── LIMIT-2: Freeform (continuous) scan ─────────────────────────────────
+
+    /**
+     * Start a continuous freeform scan.
+     *
+     * The user rotates their hand freely over 8–20 seconds instead of holding
+     * specific poses. [FreeformScanner] gates frames on quality, motion velocity,
+     * and viewpoint novelty, then auto-completes when coverage and frame count
+     * targets are met. [processFreeformScan] is triggered automatically on completion.
+     *
+     * Shares the same depth integration path (TSDF + ARCore) as the posed scan.
+     */
+    fun startFreeformScan() {
+        capturedFrames.clear()
+        biometricFrames.clear()
+        capturedDepthFrames.clear()
+        capturedScanBitmaps.clear()
+        tsdfVolume.reset()
+
+        torchOnAtScanStart = uiState.value.torchOn
+        photoStereoCapture.reset()
+        if (scanState.value.photoStereoEnabled) photoStereoCapture.start()
+        photoStereoFrameCount.value = 0
+        photoStereoComplete.value   = false
+
+        // Start incremental neural recon — trains every 30 accepted freeform frames
+        if (scanState.value.neuralReconEnabled) {
+            val carver = com.arhand.depth.NeuralImplicitCarver()
+            incrementalCarver = carver
+            incrementalTrainJob?.cancel()
+            incrementalTrainJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                var lastTrainedCount = 0
+                freeformScanner.status.collect { fs ->
+                    if (fs.state != com.arhand.scanner.FreeformScanner.State.ACTIVE) return@collect
+                    val count = fs.frameCount
+                    if (count - lastTrainedCount >= 30 && count > 0) {
+                        lastTrainedCount = count
+                        val snapshot = synchronized(freeformScanner.capturedFrames) {
+                            freeformScanner.capturedFrames.toList()
+                        }
+                        carver.trainIncremental(snapshot, normalMap = photoStereoNormalMap.value)
+                    }
+                }
+            }
+        }
+
+        freeformScanner.start()
+        scanState.value = scanState.value.copy(freeformActive = true)
+        uiState.update { it.copy(scanActive = true) }
+    }
+
+    /** User taps "Finish" during freeform scan — validates coverage then triggers processing. */
+    fun finishFreeformScan() {
+        freeformScanner.finish()
+        // Completion / failure handled by the freeformScanner.status watcher in init
+    }
+
+    fun cancelFreeformScan() {
+        incrementalTrainJob?.cancel()
+        incrementalTrainJob = null
+        incrementalCarver   = null
+        freeformScanner.reset()
+        capturedFrames.clear()
+        biometricFrames.clear()
+        capturedDepthFrames.clear()
+        capturedScanBitmaps.clear()
+        photoStereoCapture.stop()
+
+        if (scanState.value.photoStereoEnabled && !uiState.value.isFrontCamera) {
+            cameraController.torchController.setTorch(torchOnAtScanStart)
+        }
+        uiState.update { it.copy(scanActive = false) }
+        scanState.value = scanState.value.copy(freeformActive = false, freeformStatus = null)
+    }
+
+    /**
+     * Process a completed freeform scan.
+     *
+     * Builds [ScanInput] from [FreeformScanner]'s accumulated frames and delegates
+     * to [ScanPipeline.process] — identical pipeline to the posed scan. The TSDF
+     * volume and depth frames populated during the freeform capture feed the same
+     * ARCore-grounded surface reconstruction path.
+     */
+    private fun processFreeformScan() {
+        // Finalise photometric stereo if it ran
+        if (scanState.value.photoStereoEnabled && photoStereoCapture.frameCount > 0) {
+            viewModelScope.launch(Dispatchers.IO) {
+                val normalMap = photoStereoCapture.computeNormalMap()
+                if (!normalMap.isEmpty) photoStereoNormalMap.value = normalMap
+                photoStereoCapture.stop()
+                cameraController.torchController.setTorch(torchOnAtScanStart)
+            }
+        }
+
+        val input = com.arhand.feature.scan.ScanInput(
+            cloudPoints        = freeformScanner.capturedFrames.flatMap { it.first },
+            capturedFrames     = freeformScanner.capturedFrames.toList(),
+            biometricFrames    = freeformScanner.biometricFrames.toList(),
+            capturedDepth      = capturedDepthFrames.toList(),
+            capturedBitmaps    = synchronized(freeformScanner.capturedBitmaps) {
+                                     freeformScanner.capturedBitmaps.toList() },
+            normalMap          = photoStereoNormalMap.value,
+            tsdfVolume         = tsdfVolume,
+            incrementalCarver  = incrementalCarver,
+            neuralReconEnabled = scanState.value.neuralReconEnabled,
+            smplEnabled        = com.arhand.BuildConfig.FEATURE_SMPL_BODY,
+            aspect             = currentAspect.value,
+            isFrontCamera      = uiState.value.isFrontCamera,
+            modelStore         = modelStore
+        )
+
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                // B6 — Prefer real metric-depth reconstruction when ARCore Depth API
-                // frames were captured this scan; fall back to capsule-SDF otherwise.
-                val depthMesh = if (capturedDepthSnapshot.isNotEmpty()) {
-                    DepthApiCarver.carveAndExtract(capturedDepthSnapshot)
-                } else {
-                    FloatArray(0)
-                }
+                val result = com.arhand.feature.scan.ScanPipeline()
+                    .process(input, getApplication())
 
-                // G2 — Neural implicit reconstruction path.
-                // When enabled: (1) run MANO shape fitting for per-segment radius corrections,
-                // (2) train NeuralImplicitCarver MLP on the scan's landmark sets,
-                // (3) extract mesh from the learned occupancy field.
-                // Falls back in order: neural mesh → MANO shape-fitted capsule SDF → DepthCarver.
-                var neuralDiagnostics: NeuralReconDiagnostics? = null
-                val neuralOrDepthMesh: FloatArray = when {
-                    depthMesh.isNotEmpty() -> {
-                        // ARCore depth takes precedence over all capsule-SDF variants
-                        depthMesh
-                    }
-                    uiState.value.neuralReconEnabled && capturedFramesSnapshot.isNotEmpty() -> {
-                        // G2 step 1: MANO shape fitting
-                        val manoFitter = ManoShapeFitter()
-                        val shapeParams = manoFitter.fit(capturedFramesSnapshot.map { it.first })
+                renderer.depthMeshPositions = result.meshPositions
+                depthMeshPositions.value    = result.meshPositions
 
-                        // G2 step 2: Train MLP
-                        val carver = NeuralImplicitCarver()
-                        carver.train(capturedFramesSnapshot, epochs = NeuralImplicitCarver.DEFAULT_EPOCHS)
-
-                        val neuralMesh = if (carver.isTrained) {
-                            carver.extractMesh(capturedFramesSnapshot)
-                        } else {
-                            FloatArray(0)
-                        }
-
-                        neuralDiagnostics = NeuralReconDiagnostics(
-                            trainLoss       = carver.lastTrainLoss,
-                            trainEpochs     = carver.lastTrainEpochs,
-                            shapeScale      = shapeParams.segmentRadiusScale.copyOf(),
-                            meshVertexCount = neuralMesh.size / 3
-                        )
-
-                        if (neuralMesh.isNotEmpty()) {
-                            // Neural mesh succeeded
-                            neuralMesh
-                        } else {
-                            // Neural mesh empty (degenerate occupancy field) —
-                            // fall back to MANO shape-fitted capsule SDF, which is
-                            // still better than plain DepthCarver.
-                            manoFitter.carveWithShapeParams(capturedFramesSnapshot, shapeParams)
-                                .takeIf { it.isNotEmpty() }
-                                ?: DepthCarver.carveAndExtract(capturedFramesSnapshot)
-                        }
-                    }
-                    else -> {
-                        // Default path: capsule-SDF DepthCarver (plain or depth API)
-                        DepthCarver.carveAndExtract(capturedFramesSnapshot)
-                    }
-                }
-
-                val rawMeshPos = neuralOrDepthMesh
-                // B5: Laplacian smoothing — removes marching cubes staircase artifacts.
-                // λ=0.5, 3 iterations — sufficient for visual improvement, minimal distortion.
-                val meshPos = MeshSmoother.smooth(rawMeshPos, iterations = 3, lambda = 0.5f)
-                renderer.depthMeshPositions = meshPos
-                depthMeshPositions.value    = meshPos   // expose for 3D viewer
-
-                // G1 — Capture rest-pose joint positions from the latest retarget result
-                // so LiveMeshDeformer can build skinning weights for this mesh.
-                val latestResult = latestRetargetResult.value
-                if (latestResult != null) {
-                    val aspect   = currentAspect.value
-                    val mirror   = uiState.value.isFrontCamera
-                    // Build flat xyz array: one Vec3 per joint, ordered by JOINT_* index
-                    val rjp = FloatArray(com.arhand.mocap.BoneRetargeter.JOINT_COUNT * 3)
-                    // Wrist
-                    val wristPos = latestResult.wristTransform.position
-                    rjp[0] = wristPos.x; rjp[1] = wristPos.y; rjp[2] = wristPos.z
-                    // For the remaining joints use their retargeted position from bone segments.
-                    // Approximate as: wristPos + (bindDir × boneLength). Since the bind pose
-                    // maps to the same world space, we reuse the wrist pos for all non-wrist
-                    // joints as a centroid approximation. The per-vertex inv-distance weighting
-                    // in LiveMeshDeformer handles the spatial assignment correctly from the
-                    // joint centres computed here.
-                    for (ji in 1 until com.arhand.mocap.BoneRetargeter.JOINT_COUNT) {
-                        rjp[ji * 3]     = wristPos.x
-                        rjp[ji * 3 + 1] = wristPos.y
-                        rjp[ji * 3 + 2] = wristPos.z
-                    }
-                    // Override each joint with actual world position from the scanned landmarks
-                    // (the biometricFrames have the highest-quality frame landmarks).
-                    val bestFrame = biometricFramesSnapshot.maxByOrNull { it.second }
-                    if (bestFrame != null) {
-                        val lms = bestFrame.first
-                        if (lms.size >= 21) {
-                            // Bone segment base/tip → joint centre approximated as midpoint
-                            for ((jointIdx, baseIdx, tipIdx) in com.arhand.mocap.BoneRetargeter.BONE_SEGMENTS) {
-                                val baseLm = lms[baseIdx]; val tipLm = lms[tipIdx]
-                                val (bx, by, bz) = com.arhand.util.landmarkToWorld(baseLm, aspect, mirror)
-                                val (tx, ty, tz) = com.arhand.util.landmarkToWorld(tipLm, aspect, mirror)
-                                rjp[jointIdx * 3]     = (bx + tx) * 0.5f
-                                rjp[jointIdx * 3 + 1] = (by + ty) * 0.5f
-                                rjp[jointIdx * 3 + 2] = (bz + tz) * 0.5f
-                            }
-                        }
-                    }
+                result.restJointPositions?.let { rjp ->
                     restJointPositions = rjp
-                    // Rebuild deformer for the new mesh (invalidates previous skin weights)
-                    liveMeshDeformer.buildSkinWeights(meshPos, rjp)
+                    liveMeshDeformer.buildSkinWeights(result.meshPositions, rjp)
                 }
 
-                val glbFile = GLBExporter.export(
-                    getApplication(), meshPos, cloudPointsSnapshot
+                scanState.value = scanState.value.copy(
+                    hasStoredModel         = result.glbFile != null,
+                    exportedGlbPath        = result.glbFile?.absolutePath,
+                    handBiometrics         = result.biometrics,
+                    biometricHistory       = result.biometricHistory,
+                    jointRomData           = null,
+                    neuralReconDiagnostics = result.neuralDiagnostics,
+                    freeformActive         = false
                 )
 
-                val scoresJson = scanner.status.value.poseScores
-                    .joinToString(",", prefix="[", postfix="]") { "%.3f".format(it) }
-
-                // Compute hand biometrics from the accumulated landmark frames
-                val biometrics = HandBiometrics.compute(
-                    frames = biometricFramesSnapshot,
-                    aspect = currentAspect.value
-                )
-
-                modelStore.saveModel(glbFile, cloudPointsSnapshot.size, scoresJson, biometrics)
-                // D4 — Append to biometric history (no-op when biometrics is null)
-                if (biometrics != null) modelStore.saveToHistory(biometrics)
-                val updatedHistory = modelStore.loadHistory()
-
-                // G5 — Compute photometric normal map if pairs were accumulated.
-                // This is a pure CPU operation; done here on the Default dispatcher.
-                if (uiState.value.photoStereoEnabled && photoStereoCapture.frameCount > 0) {
-                    val normalMap = photoStereoCapture.computeNormalMap()
-                    if (!normalMap.isEmpty) {
-                        photoStereoNormalMap.value = normalMap
+                result.calibratedOefCutoff?.let { cutoff ->
+                    result.calibratedOefBeta?.let { beta ->
+                        handPipeline.setOefParams(cutoff, beta)
+                        getApplication<Application>().oefDataStore.edit { prefs ->
+                            prefs[KEY_OEF_CUTOFF] = cutoff
+                            prefs[KEY_OEF_BETA]   = beta
+                        }
                     }
-                    // Stop the capture (it may have already stopped when complete, but
-                    // guard against early scan termination before TARGET_PAIRS were reached).
+                }
+
+                incrementalTrainJob?.cancel()
+                incrementalTrainJob = null
+                incrementalCarver   = null
+
+                result.glbFile?.let { f ->
+                    val scoresJson = "[]"   // freeform has no pose scores
+                    modelStore.saveModel(f, input.cloudPoints.size, scoresJson, result.biometrics)
+                }
+
+                freeformScanner.reset()
+                uiState.update { it.copy(scanActive = false) }
+
+            } catch (e: Exception) {
+                android.util.Log.e("AppViewModel", "processFreeformScan failed", e)
+                freeformScanner.reset()
+                photoStereoCapture.stop()
+                if (scanState.value.photoStereoEnabled && !uiState.value.isFrontCamera) {
+                    cameraController.torchController.setTorch(torchOnAtScanStart)
+                }
+                scanState.value = scanState.value.copy(freeformActive = false)
+                uiState.update { it.copy(scanActive = false) }
+            }
+        }
+    }
+    /**
+     * Processes a completed scan using [ScanPipeline].
+     *
+     * Snapshots all mutable buffers synchronously on the calling thread, then
+     * delegates the full computation to [ScanPipeline.process] on [Dispatchers.Default].
+     * The resulting [ScanResult] is distributed to the renderer, scanState, and
+     * LiveMeshDeformer — no processing logic lives here.
+     */
+    private fun processScan() {
+        val input = com.arhand.feature.scan.ScanInput(
+            cloudPoints        = scanner.cloudPoints.toList(),
+            capturedFrames     = capturedFrames.toList(),
+            biometricFrames    = biometricFrames.toList(),
+            capturedDepth      = capturedDepthFrames.toList(),
+            capturedBitmaps    = synchronized(capturedScanBitmaps) { capturedScanBitmaps.toList() },
+            normalMap          = photoStereoNormalMap.value,
+            tsdfVolume         = tsdfVolume,
+            incrementalCarver  = incrementalCarver,
+            neuralReconEnabled = scanState.value.neuralReconEnabled,
+            smplEnabled        = com.arhand.BuildConfig.FEATURE_SMPL_BODY,
+            aspect             = currentAspect.value,
+            isFrontCamera      = uiState.value.isFrontCamera,
+            modelStore         = modelStore
+        )
+
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val result = com.arhand.feature.scan.ScanPipeline()
+                    .process(input, getApplication())
+
+                // Distribute ScanResult to all consumers
+                renderer.depthMeshPositions  = result.meshPositions
+                depthMeshPositions.value     = result.meshPositions
+
+                result.restJointPositions?.let { rjp ->
+                    restJointPositions = rjp
+                    liveMeshDeformer.buildSkinWeights(result.meshPositions, rjp)
+                }
+
+                scanState.value = scanState.value.copy(
+                    hasStoredModel         = result.glbFile != null,
+                    exportedGlbPath        = result.glbFile?.absolutePath,
+                    handBiometrics         = result.biometrics,
+                    biometricHistory       = result.biometricHistory,
+                    jointRomData           = scanner.romData,
+                    neuralReconDiagnostics = result.neuralDiagnostics
+                )
+
+                result.calibratedOefCutoff?.let { cutoff ->
+                    result.calibratedOefBeta?.let { beta ->
+                        handPipeline.setOefParams(cutoff, beta)
+                        getApplication<Application>().oefDataStore.edit { prefs ->
+                            prefs[KEY_OEF_CUTOFF] = cutoff
+                            prefs[KEY_OEF_BETA]   = beta
+                        }
+                    }
+                }
+
+                // Clean up incremental carver state — pipeline has consumed it
+                incrementalTrainJob?.cancel()
+                incrementalTrainJob = null
+                incrementalCarver   = null
+
+                // Finalise photometric stereo capture if it ran
+                if (scanState.value.photoStereoEnabled && photoStereoCapture.frameCount > 0) {
+                    val normalMap = photoStereoCapture.computeNormalMap()
+                    if (!normalMap.isEmpty) photoStereoNormalMap.value = normalMap
                     photoStereoCapture.stop()
-                    // Restore torch to the state it was in when the scan started
                     cameraController.torchController.setTorch(torchOnAtScanStart)
                 }
 
-                scanner.markDone()
-                uiState.update {
-                    it.copy(
-                        scanActive             = false,
-                        exportedGlbPath        = glbFile.absolutePath,
-                        hasStoredModel         = true,
-                        handBiometrics         = biometrics,
-                        biometricHistory       = updatedHistory,
-                        jointRomData           = scanner.romData,
-                        neuralReconDiagnostics = neuralDiagnostics
-                    )
+                result.glbFile?.let { f ->
+                    val scoresJson = scanner.status.value.poseScores
+                        .joinToString(",", "[", "]") { "%.3f".format(it) }
+                    modelStore.saveModel(f, input.cloudPoints.size, scoresJson, result.biometrics)
                 }
+
+                scanner.markDone()
+                uiState.update { it.copy(scanActive = false) }
+
             } catch (e: Exception) {
                 scanner.markFailed(e.message ?: "Processing error")
                 photoStereoCapture.stop()
-                // Restore torch if stereo flash had taken control of it
-                if (uiState.value.photoStereoEnabled && !uiState.value.isFrontCamera) {
+                if (scanState.value.photoStereoEnabled && !uiState.value.isFrontCamera) {
                     cameraController.torchController.setTorch(torchOnAtScanStart)
                 }
                 uiState.update { it.copy(scanActive = false) }
@@ -859,7 +1314,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /**
+        /**
      * Load a user GLB asset from [uri] on the IO dispatcher, then rebuild [boneRetargeter].
      * Pass null to revert to the default puppet.
      *
@@ -872,30 +1327,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * ```
      */
     fun loadAsset(uri: Uri?, displayName: String?) {
-        viewModelScope.launch(Dispatchers.IO) {
-            uiState.update { it.copy(assetLoading = true) }
-            try {
-                val asset = AssetLoader.load(getApplication(), uri)
-                loadedAsset   = asset
-                boneRetargeter = BoneRetargeter(asset.bindPose)
-                renderer.loadedAsset = asset   // forward to GL thread
-                uiState.update {
-                    it.copy(
-                        assetLoading    = false,
-                        loadedAssetName = if (uri == null) null else (displayName ?: "asset.glb")
-                    )
-                }
-            } catch (e: Exception) {
-                loadedAsset   = AssetLoader.DEFAULT_PUPPET
-                boneRetargeter = BoneRetargeter(AssetLoader.DEFAULT_PUPPET.bindPose)
-                renderer.loadedAsset = null
-                uiState.update { it.copy(assetLoading = false, loadedAssetName = null) }
-            }
-        }
+        if (uri == null) { removeAsset(); return }
+        assetManager.loadFromUri(uri, displayName ?: "asset.glb")
     }
 
+    fun loadBundledAsset(filename: String, displayName: String) =
+        assetManager.loadBundled(filename, displayName)
+
+    /** ASSET-1 — Remove the currently loaded user asset and revert to the default puppet. */
+    fun removeAsset() = assetManager.remove()
+
     fun shareGlb() {
-        val path = uiState.value.exportedGlbPath ?: return
+        val path = scanState.value.exportedGlbPath ?: return
         // Share intent launched from UI layer
     }
 
@@ -933,9 +1376,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * The REC button in [ControlPanel] calls this.
      */
     fun startRecording() {
-        motionRecorder.start()
-        uiState.update { it.copy(isRecording = true, exportedBvhPath = null) }
+        recordingManager.markRecordingStarted()
+        recordingManager.start()  // RecordingManager.start() calls motionRecorder.start() internally
     }
+
+    /** Gap 7 — Switch the active workflow mode. */
+    fun setWorkflowMode(mode: WorkflowMode) {
+        uiState.update { it.copy(workflowMode = mode) }
+    }
+
+    /** Gap 5 — Update the take label while not recording. */
+    fun setTakeLabel(label: String) = recordingManager.setLabel(label)
 
     /**
      * Stop recording and export the buffered frames as both a BVH file and an
@@ -946,37 +1397,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * Files are written to the app's external "mocap" directory.
      */
     fun stopRecordingAndExport() {
-        motionRecorder.stop()
-        uiState.update { it.copy(isRecording = false) }
+        val scannedOffsets: Map<Int, com.arhand.util.Vec3>? = restJointPositions?.let { rjp ->
+            buildMap {
+                for (jointIdx in 0 until BoneRetargeter.JOINT_COUNT) {
+                    val base = jointIdx * 3
+                    if (base + 2 < rjp.size)
+                        put(jointIdx, com.arhand.util.Vec3(rjp[base], rjp[base + 1], rjp[base + 2]))
+                }
+            }
+        }
+        val outputDir = getApplication<android.app.Application>()
+            .getExternalFilesDir("mocap") ?: return
 
         viewModelScope.launch(Dispatchers.IO) {
-            val outputDir = getApplication<android.app.Application>()
-                .getExternalFilesDir("mocap") ?: return@launch
-            outputDir.mkdirs()
-
-            val snapshot = motionRecorder.frameSnapshot()
-            val label    = "take_${System.currentTimeMillis() / 1000}"
-
-            // BVH export
-            val bvhFile = motionRecorder.exportBvh(outputDir, label)
-            if (bvhFile != null) {
-                uiState.update { it.copy(exportedBvhPath = bvhFile.absolutePath) }
-            }
-
-            // glTF animated GLB export
-            val gltfFile = GltfAnimationExporter.export(
-                frames    = snapshot,
-                asset     = loadedAsset,
-                outputDir = outputDir,
-                label     = "${label}_anim"
-            )
-            if (gltfFile != null) {
-                uiState.update { it.copy(exportedGltfPath = gltfFile.absolutePath) }
-            }
+            recordingManager.exportAndAppend(outputDir, scannedOffsets, loadedAsset)
         }
     }
 
-    // ─── Full body + face extension ───────────────────────────────────────────
+    /**
+     * PERF-2 — Derive optimal [OneEuroFilter] parameters from scan biometric frames.
+     *
+     * Uses the static-hold frames (minimum motion) to estimate the landmark noise floor,
+     * then computes the optimal cutoff frequency and beta coefficient.
+     *
+     * @return Pair(optimalCutoff, optimalBeta) or null if insufficient data.
+     */
 
     /** Guards against launching the FullBodyFrame merge collector more than once. */
     private var fullBodyCollectorStarted = false
@@ -986,34 +1431,51 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         fullBodyCollectorStarted = true
         viewModelScope.launch {
             handPipeline.processed.collect { hands ->
-                if (uiState.value.bodyTrackingEnabled || uiState.value.faceTrackingEnabled) {
+                if (trackingManager.state.value.bodyEnabled || trackingManager.state.value.faceEnabled) {
                     val leftSlot  = hands.firstOrNull { it.slotIndex == 0 }?.landmarks
                     val rightSlot = hands.firstOrNull { it.slotIndex == 1 }?.landmarks
                     latestFullBodyFrame.value = FullBodyFrame(
-                        pose      = if (uiState.value.bodyTrackingEnabled) bodyPipeline.processed.value else null,
-                        face      = if (uiState.value.faceTrackingEnabled) facePipeline.processed.value else null,
-                        leftHand  = leftSlot,
-                        rightHand = rightSlot
+                        pose        = if (trackingManager.state.value.bodyEnabled) bodyPipeline.processed.value else null,
+                        face        = if (trackingManager.state.value.faceEnabled) facePipeline.processed.value else null,
+                        leftHand    = leftSlot,
+                        rightHand   = rightSlot,
+                        // FACE-3 — carry derived expressions so CompositeGestureClassifier
+                        // can use the classify(FullBodyFrame) overload correctly
+                        expressions = facePipeline.expressions.value
+                            .takeIf { trackingManager.state.value.faceEnabled }
                     )
+
+                    // BODY-1 — Retarget body landmarks to joint rotations each frame.
+                    // Only runs when body tracking is enabled and landmarks are available.
+                    if (trackingManager.state.value.bodyEnabled) {
+                        val poseLms = bodyPipeline.processed.value
+                        if (poseLms != null) {
+                            val bodyResult = bodyRetargeter.retarget(poseLms)
+                            latestBodyRetargetResult.value = bodyResult
+                        }
+                    }
                 }
             }
         }
     }
 
     /**
+     * Enable or disable body pose tracking.
      *
      * On first enable, initialises [BodyPipeline] using [pose_landmarker_lite.task]
      * from assets. Subsequent toggles reuse the same landmarker instance.
      * Body landmarks are merged into [latestFullBodyFrame] every hand-pipeline frame.
      */
     fun enableBodyTracking(enabled: Boolean) {
-        if (enabled && !uiState.value.bodyTrackingEnabled) {
+        trackingManager.setBodyTracking(enabled)
+        if (enabled) {
             bodyPipeline.init(getApplication())
             ensureFullBodyCollector()
-        } else if (!enabled) {
+        } else {
             bodyPipeline.close()
+            bodyRetargeter.reset()
+            latestBodyRetargetResult.value = null
         }
-        uiState.update { it.copy(bodyTrackingEnabled = enabled) }
     }
 
     /**
@@ -1023,13 +1485,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * Expression values are available via [FacePipeline.expressions] as a [StateFlow].
      */
     fun enableFaceTracking(enabled: Boolean) {
-        if (enabled && !uiState.value.faceTrackingEnabled) {
+        trackingManager.setFaceTracking(enabled)
+        if (enabled) {
             facePipeline.init(getApplication())
             ensureFullBodyCollector()
-        } else if (!enabled) {
+        } else {
             facePipeline.close()
         }
-        uiState.update { it.copy(faceTrackingEnabled = enabled) }
     }
 
     // ─── OSC streaming ────────────────────────────────────────────────────────
@@ -1042,34 +1504,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * @param schema OSC address schema. Defaults to the current [AppUiState.oscSchema].
      */
     fun startOscStreaming(
-        host:   String    = OscStreamer.DEFAULT_HOST,
-        port:   Int       = OscStreamer.defaultPortFor(uiState.value.oscSchema),
-        schema: OscSchema = uiState.value.oscSchema
-    ) {
-        oscStreamer.start(host, schema, port)
-        uiState.update { it.copy(isOscStreaming = true, oscHost = host, oscPort = port, oscSchema = schema) }
-    }
+        host:   String    = oscManager.state.value.host,
+        port:   Int       = oscManager.state.value.port,
+        schema: OscSchema = oscManager.state.value.schema
+    ) = oscManager.start(host, port, schema)
 
-    /** Stop OSC broadcasting and close the UDP socket. */
-    fun stopOscStreaming() {
-        oscStreamer.stop()
-        uiState.update { it.copy(isOscStreaming = false) }
-    }
+    fun stopOscStreaming() = oscManager.stop()
 
-    /**
-     * Switch the active OSC schema preset.
-     *
-     * If streaming is active, the new schema takes effect on the next sendFrame call —
-     * no restart required. Port is updated to the schema default only when not streaming.
-     */
-    fun setOscSchema(schema: OscSchema) {
-        oscStreamer.schema = schema
-        val newPort = if (oscStreamer.isStreaming) uiState.value.oscPort
-                      else OscStreamer.defaultPortFor(schema)
-        uiState.update { it.copy(oscSchema = schema, oscPort = newPort) }
-    }
-
-    // ─── G4: Gesture shortcut dispatcher ──────────────────────────────────────
+    fun setOscSchema(schema: OscSchema) = oscManager.setSchema(schema)
 
     /**
      * Built-in gesture → app action mapping.
@@ -1087,20 +1529,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * for user-configurable macro triggers in a future UX pass.
      */
     private fun dispatchGestureShortcut(gesture: Gesture) {
-        when (gesture) {
+
+        // When face tracking is off, fe is null and modifier is always NONE —
+        // existing behaviour is fully preserved.
+        val fe = facePipeline.expressions.value.takeIf { trackingManager.state.value.faceEnabled }
+        val composite = CompositeGestureClassifier.classify(gesture, fe)
+
+        when (composite.base) {
             Gesture.FIST -> {
                 // Only trigger scan start if no scan is running and no model stored yet
-                if (!uiState.value.scanActive && !uiState.value.hasStoredModel) startScan()
+                if (!uiState.value.scanActive && !(assetManager.state.value.name != null)) startScan()
             }
             Gesture.PEACE -> switchCamera()
             Gesture.ROCK  -> toggleTorch()
             Gesture.CALL  -> {
-                if (uiState.value.oscMode == OscMode.SEND) {
-                    if (uiState.value.isOscStreaming) stopOscStreaming()
+                if (oscManager.state.value.mode == OscMode.SEND) {
+                    if (oscManager.state.value.isStreaming) stopOscStreaming()
                     else startOscStreaming()
                 }
             }
-            // Reserved: OPEN_PALM, THUMBS_UP, POINT_UP, OK — no-op for now
+            // Reserved: OPEN_PALM, THUMBS_UP, POINT_UP, OK — no-op for now.
+            // composite.modifier (BLINK / JAW / BROW) available for future extended bindings.
             else -> {}
         }
     }
@@ -1120,7 +1569,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         when (mode) {
             OscMode.SEND -> {
                 stopOscReceiving()
-                uiState.update { it.copy(oscMode = OscMode.SEND) }
+                oscManager.setMode(OscMode.SEND)
             }
             OscMode.RECEIVE -> {
                 stopOscStreaming()
@@ -1143,14 +1592,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         oscReceiver.start(port)
         if (!oscReceiver.isReceiving) return  // port bind failed
 
-        uiState.update { it.copy(
-            oscMode       = OscMode.RECEIVE,
-            isOscReceiving = true,
-            oscReceivePort = port
-        )}
+        oscManager.setMode(OscMode.RECEIVE)
+        oscManager.setReceivePort(port)
 
-        // Cancel any previous collector before launching a new one so toggling
-        // RECEIVE mode does not accumulate stale coroutines writing to the renderer.
         oscReceiverJob?.cancel()
         oscReceiverJob = viewModelScope.launch {
             oscReceiver.frames.collect { result ->
@@ -1159,23 +1603,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Stop the OSC receiver and revert to local hand tracking display. */
     fun stopOscReceiving() {
         oscReceiver.stop()
         oscReceiverJob?.cancel()
         oscReceiverJob = null
-        uiState.update { it.copy(isOscReceiving = false) }
+        oscManager.setMode(OscMode.SEND)
     }
 
     override fun onCleared() {
         handTrackerManager?.close()
         if (::cameraController.isInitialized) cameraController.stop()
-        oscStreamer.stop()
+        oscManager.stop()          // resets health counters, closes socket cleanly
         oscReceiver.stop()
         oscReceiverJob?.cancel()
         bodyPipeline.close()
+        bodyRetargeter.reset()
         facePipeline.close()
-        arDepthSession?.close()
+        spatialLayer.close()
+        freeformScanner.reset()
         super.onCleared()
     }
 }

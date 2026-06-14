@@ -62,6 +62,12 @@ class BoneRetargeter(private val bindPose: BindPose) {
         // Total joints driven
         const val JOINT_COUNT = 16
 
+        // BODY-3 — Wrist anchor constants
+        /** Minimum body wrist visibility to start blending toward body position. */
+        const val BODY_WRIST_VIS_THRESHOLD = 0.6f
+        /** Maximum blend weight toward body wrist (keeps hand anchor influence ≥ 30%). */
+        const val BODY_WRIST_MAX_BLEND     = 0.70f
+
         /**
          * Bone segment definitions: each entry is (jointIndex, baseLandmarkIdx, tipLandmarkIdx).
          * Used by [retarget] to compute live bone directions.
@@ -119,13 +125,27 @@ class BoneRetargeter(private val bindPose: BindPose) {
     /**
      * Retarget a single frame of [HandLandmarks] to joint rotations.
      *
-     * @param lms      21-point landmark list from the tracking pipeline
-     * @param aspect   Viewport aspect ratio (width / height)
-     * @param mirrorX  True for front-facing camera
+     * @param lms            21-point landmark list from the tracking pipeline
+     * @param aspect         Viewport aspect ratio (width / height)
+     * @param mirrorX        True for front-facing camera
+     * @param bodyWristHint  BODY-3 — World-space wrist position from [BodyRetargeter],
+     *                       or null when body tracking is inactive. When provided and
+     *                       body wrist visibility exceeds [BODY_WRIST_VIS_THRESHOLD],
+     *                       the hand wrist root is blended toward the body wrist
+     *                       position, eliminating the visible floating seam between
+     *                       the hand and body skeletons.
+     * @param bodyWristVis   Visibility score of the body wrist landmark (0–1).
+     *                       Used as the blend weight: 0 = hand position, 1 = body position.
      * @return [RetargetResult] with all joint rotations and the wrist transform,
      *         or null if the landmark list is incomplete.
      */
-    fun retarget(lms: HandLandmarks, aspect: Float, mirrorX: Boolean): RetargetResult? {
+    fun retarget(
+        lms:           HandLandmarks,
+        aspect:        Float,
+        mirrorX:       Boolean,
+        bodyWristHint: Vec3?  = null,
+        bodyWristVis:  Float  = 0f
+    ): RetargetResult? {
         if (lms.size < 21) return null
 
         // Convert all 21 landmarks to world-space Vec3
@@ -146,10 +166,53 @@ class BoneRetargeter(private val bindPose: BindPose) {
         }
 
         // Wrist root transform
-        val wristPos = world[LM.WRIST]
-        val wristBindDir = (world[LM.MIDDLE_MCP] - world[LM.WRIST]).normalized()
-        val wristBindRef  = bindPose.boneDirections[JOINT_INDEX_MCP] ?: Vec3(0f, 1f, 0f)
-        val wristRot = shortestArcQuaternion(wristBindRef, wristBindDir)
+        // BODY-3 — Blend hand wrist toward body wrist when body tracking is active.
+        // Weight = bodyWristVis, clamped to [0, BODY_WRIST_MAX_BLEND] so hand
+        // tracking always retains at least (1 - BODY_WRIST_MAX_BLEND) influence.
+        // This eliminates the floating seam between hand and body skeletons while
+        // keeping the hand anchor responsive when body confidence is low.
+        val handWristPos = world[LM.WRIST]
+        val wristPos = if (bodyWristHint != null && bodyWristVis >= BODY_WRIST_VIS_THRESHOLD) {
+            val blend = (bodyWristVis * BODY_WRIST_MAX_BLEND).coerceIn(0f, BODY_WRIST_MAX_BLEND)
+            handWristPos.lerp(bodyWristHint, blend)
+        } else {
+            handWristPos
+        }
+
+        // Palm-plane wrist rotation — two-axis construction.
+        //
+        // Previous: shortest-arc from bind +Y to wrist→middleMCP direction.
+        // Problem:  shortest-arc is under-constrained — it leaves roll (axial rotation
+        //           around the pointing axis) undefined, so lateral hand rolls produce
+        //           a visually incorrect wrist twist in the rig.
+        //
+        // Fix: build an orthonormal frame from two palm vectors:
+        //   forward = wrist → middle MCP (primary pointing axis)
+        //   right   = index MCP → pinky MCP (lateral palm axis)
+        //   up      = cross(forward, right), re-orthogonalized
+        // Then compute the quaternion that maps the bind-pose frame to this live frame.
+        // This fully constrains all 3 rotational degrees of freedom including roll.
+        //
+        // Bind-pose frame (symmetricBindPose): forward = +Y, right = +X, up = +Z.
+        val liveForward = (world[LM.MIDDLE_MCP] - world[LM.WRIST]).normalized()
+        val liveRight   = (world[LM.PINKY_MCP]  - world[LM.INDEX_MCP]).normalized()
+        val liveUp      = liveForward.cross(liveRight).normalized()
+        // Re-orthogonalize right to ensure a clean frame
+        val liveRightOrtho = liveUp.cross(liveForward).normalized()
+
+        // Bind-pose axes (matches symmetricBindPose and most T-pose rigs)
+        val bindForward = bindPose.boneDirections[JOINT_MIDDLE_MCP] ?: Vec3(0f, 1f, 0f)
+        val bindRight   = Vec3(1f, 0f, 0f)
+        val bindUp      = bindForward.cross(bindRight).normalized()
+
+        // Quaternion from bind frame to live frame via two shortest-arc steps:
+        //   q1: align forward axes
+        //   q2: align right axes in the plane perpendicular to the aligned forward
+        val q1 = shortestArcQuaternion(bindForward, liveForward)
+        // Rotate bind right by q1 to get the intermediate right axis
+        val bindRightRotated = q1.rotate(bindRight)
+        val q2 = shortestArcQuaternion(bindRightRotated, liveRightOrtho)
+        val wristRot = (q2 * q1).normalized()
 
         rotations[JOINT_WRIST] = wristRot
 
@@ -178,6 +241,20 @@ class BoneRetargeter(private val bindPose: BindPose) {
      * then normalise. Handles the anti-parallel edge case (180° rotation) by picking
      * a perpendicular axis.
      */
+    // Rotate a vector by a unit quaternion: v' = q * (0,v) * q⁻¹
+    // Used by the palm-plane wrist rotation to transform the bind right axis.
+    private fun Quaternion.rotate(v: Vec3): Vec3 {
+        // Optimized Rodrigues: v' = v + 2w(q×v) + 2(q×(q×v))
+        val qv = Vec3(x, y, z)
+        val uv = qv.cross(v)
+        val uuv = qv.cross(uv)
+        return Vec3(
+            v.x + 2f * (w * uv.x + uuv.x),
+            v.y + 2f * (w * uv.y + uuv.y),
+            v.z + 2f * (w * uv.z + uuv.z)
+        )
+    }
+
     private fun shortestArcQuaternion(from: Vec3, to: Vec3): Quaternion {
         val dot = from.dot(to).coerceIn(-1f, 1f)
 
@@ -227,6 +304,62 @@ data class RetargetResult(
      * without per-joint translation, non-wrist joints all pivot around the world origin.
      */
     val jointPositions: Map<Int, Vec3> = emptyMap()
+)
+
+// ─── ARCH-1: Unified full-body frame ─────────────────────────────────────────
+
+/**
+ * ARCH-1 — One data structure representing the complete tracked performance for a frame.
+ *
+ * Replaces the three independent streams (hand [RetargetResult], [BodyRetargetResult],
+ * [com.arhand.tracking.FaceExpressions]) that previously flowed through separate paths
+ * to [com.arhand.mocap.OscStreamer], [MotionRecorder], and [com.arhand.export.GltfAnimationExporter].
+ *
+ * Any field may be null if that pipeline is inactive or produced no result this frame.
+ * Consumers check nullability and degrade gracefully — e.g. OSC skips body bones when
+ * [body] is null, BVH skips face channels when [face] is null.
+ */
+data class FullBodyRetargetResult(
+    /** Unix timestamp of this frame in milliseconds. */
+    val timestamp:       Long,
+    /** Primary hand retarget result (slot 0, typically right hand). Null when hand absent. */
+    val handPrimary:     RetargetResult?,
+    /** Secondary hand retarget result (slot 1, typically left hand). Null when absent. */
+    val handSecondary:   RetargetResult?,
+    /** Body joint rotations from [com.arhand.mocap.BodyRetargeter]. Null when body tracking off. */
+    val body:            BodyRetargetResult?,
+    /** Face expression intensities from [com.arhand.tracking.FacePipeline]. Null when face tracking off. */
+    val face:            com.arhand.tracking.FaceExpressions?,
+    /** Mean tracking confidence across all active pipelines (0–1). */
+    val frameConfidence: Float,
+
+    // ── Spatial layer fields (always populated when SpatialLayer is running) ──
+
+    /**
+     * True when ARCore is in TRACKING state and positions in this frame are
+     * metric world-space (metres, gravity-aligned Y-up). False when positions
+     * are camera-relative estimates (MediaPipe world landmarks, approximately metric).
+     *
+     * Consumers (OSC, BVH, rendering) can use this to tag output quality or
+     * choose between world-space and camera-space coordinate systems.
+     */
+    val metricGrounded:  Boolean = false,
+
+    /**
+     * ARCore camera world position (metres) at the time this frame was captured.
+     * NaN when [metricGrounded] is false. Used by receivers to reconstruct absolute
+     * hand position in the scene coordinate frame.
+     */
+    val cameraWorldX:    Float   = Float.NaN,
+    val cameraWorldY:    Float   = Float.NaN,
+    val cameraWorldZ:    Float   = Float.NaN,
+
+    /**
+     * Depth sensing confidence for this frame (0–1).
+     * 1.0 = ARCore high-confidence points dominate.
+     * 0.0 = no depth data available.
+     */
+    val depthConfidence: Float   = 0f
 )
 
 data class WristTransform(

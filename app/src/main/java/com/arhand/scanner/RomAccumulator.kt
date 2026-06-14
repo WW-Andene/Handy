@@ -3,6 +3,7 @@ package com.arhand.scanner
 import com.arhand.tracking.HandLandmarks
 import com.arhand.tracking.LM
 import com.arhand.util.Vec3
+import com.arhand.scanner.QualityEngine
 import kotlin.math.PI
 import kotlin.math.acos
 import kotlin.math.sqrt
@@ -63,9 +64,30 @@ class RomAccumulator {
     /** Number of valid frames that updated each joint. */
     private val frameCount = IntArray(JOINT_COUNT) { 0 }
 
-    /** Feed one frame of landmarks into the accumulator. */
-    fun update(lms: HandLandmarks) {
+    /**
+     * Feed one frame of landmarks into the accumulator.
+     *
+     * IMP-R2: velocity gating — [prevLms] is used to compute a temporal consistency
+     * score via [QualityEngine.temporalConsistencyScore]. Frames where the hand is
+     * moving fast (mid-gesture transitions) are excluded because they produce
+     * non-physiological intermediate angles that skew the min/max ROM readings.
+     *
+     * Threshold: consistency < 0.65 → frame rejected.
+     * This corresponds to mean inter-frame displacement > ~8% of palm size,
+     * which is consistent with active motion between pose targets.
+     *
+     * @param lms      Current frame landmarks.
+     * @param prevLms  Previous frame landmarks for velocity estimation. Pass null to
+     *                 accept the frame unconditionally (e.g. first frame of session).
+     */
+    fun update(lms: HandLandmarks, prevLms: HandLandmarks? = null) {
         if (lms.size < 21) return
+
+        // Reject fast-moving frames — mid-gesture angles contaminate ROM measurement.
+        if (prevLms != null) {
+            val consistency = QualityEngine.temporalConsistencyScore(lms, prevLms)
+            if (consistency < 0.65f) return
+        }
 
         JOINT_TRIPLETS.forEachIndexed { i, (proxIdx, jIdx, distIdx) ->
             val prox = lms[proxIdx]

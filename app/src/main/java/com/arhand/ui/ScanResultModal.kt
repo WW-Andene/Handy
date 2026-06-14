@@ -46,14 +46,20 @@ fun ScanResultModal(
     jointRomData: JointRomData? = null,
     onShare: () -> Unit,
     onRescan: () -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    /** ARCH-3 — Live retarget result forwarded to [ModelViewerScreen]. */
+    retargetResult: com.arhand.mocap.RetargetResult? = null,
+    /** ARCH-3 — Loaded skinned asset forwarded to [ModelViewerScreen]. */
+    loadedAsset: com.arhand.mocap.LoadedAsset? = null
 ) {
     var showViewer by remember { mutableStateOf(false) }
 
     if (showViewer) {
         ModelViewerScreen(
-            meshPositions = meshPositions,
-            onDismiss     = { showViewer = false }
+            meshPositions  = meshPositions,
+            onDismiss      = { showViewer = false },
+            retargetResult = retargetResult,
+            loadedAsset    = loadedAsset
         )
         return
     }
@@ -311,7 +317,6 @@ fun BiometricsPanel(b: HandBiometrics, history: List<BiometricHistoryEntry> = em
             fontFamily = FontFamily.Monospace
         )
 
-        // D5 — Joint ROM section
         if (romData != null) {
             val measuredJoints = romData.joints.filter { it.measured }
             if (measuredJoints.isNotEmpty()) {
@@ -322,7 +327,6 @@ fun BiometricsPanel(b: HandBiometrics, history: List<BiometricHistoryEntry> = em
             }
         }
 
-        // D3 — Ring size calculator
         val ringSizes = ringSizesFromKnuckleBreadth(b.knuckleBreadth)
         if (ringSizes != null) {
             Spacer(Modifier.height(10.dp))
@@ -359,7 +363,6 @@ fun BiometricsPanel(b: HandBiometrics, history: List<BiometricHistoryEntry> = em
             )
         }
 
-        // D4 — Biometric history sparklines
         if (history.size >= 2) {
             Spacer(Modifier.height(10.dp))
             Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.07f)))
@@ -457,7 +460,6 @@ private fun ringSizesFromKnuckleBreadth(knuckleBreadthWorld: Float): RingSizes? 
 
     return RingSizes(us = usStr, eu = euStr, uk = ukStr, circumferenceMm = circumMm)
 }
-
 
 /**
  * D4 — Mini sparkline composable.
@@ -605,7 +607,7 @@ private fun FingerLengthCell(abbrev: String, worldLen: Float) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// D5 — Joint ROM panel
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**

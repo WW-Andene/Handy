@@ -41,16 +41,40 @@ fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
  * Convert normalized landmark coordinates to world space.
  * Mirrors the mapping used by HandRenderer and SCANNER.buildModel in the prototype.
  *
- * @param lm      Normalized landmark (x,y in [0,1], z relative)
- * @param aspect  Viewport aspect ratio (width / height)
+ * When MediaPipe world landmarks are available (worldX/worldY/worldZ all non-zero),
+ * all three metric axes are used directly — eliminating the projection distortion
+ * that the screen-space x/y path introduces (normalized coords encode both position
+ * and hand-camera distance). The world landmark coordinate system is hand-center
+ * origin, Y-up, X-right, Z toward camera; negate X for mirror and Z for right-hand
+ * renderer convention.
+ *
+ * Falls back to the screen-space reconstruction when world landmarks are unavailable
+ * (worldX == 0f && worldY == 0f), preserving full backward compatibility.
+ *
+ * @param lm      Normalized landmark (x,y in [0,1], z relative, worldX/Y/Z in meters)
+ * @param aspect  Viewport aspect ratio (width / height) — only used in fallback path
  * @param mirrorX Whether to mirror X (front camera = true)
  * @return Triple of (worldX, worldY, worldZ)
  */
 fun landmarkToWorld(lm: Landmark, aspect: Float, mirrorX: Boolean): Triple<Float, Float, Float> {
+    // BUG-2 fix: use all three metric world axes when available.
+    // Previous code fetched worldZ from the world landmark API but reconstructed
+    // X and Y from projection-distorted screen-space coordinates, discarding the
+    // metric X/Y that MediaPipe computes. worldX and worldY are now populated in
+    // HandTracker.parseResult() alongside worldZ.
+    if (lm.worldX != 0f || lm.worldY != 0f) {
+        // Metric world-space path — no projection distortion.
+        // MediaPipe world X: positive = right (camera frame). Mirror for front camera.
+        // MediaPipe world Y: positive = up. No inversion needed.
+        // MediaPipe world Z: positive = toward camera. Negate for renderer convention.
+        val wx = if (mirrorX) -lm.worldX else lm.worldX
+        return Triple(wx, -lm.worldY, -lm.worldZ)
+    }
+    // Fallback: screen-space reconstruction — unchanged from original.
     val sx = if (mirrorX) 1f - lm.x else lm.x
     val wx = (sx - 0.5f) * 2f * aspect * VIEW_SCALE
     val wy = -(lm.y - 0.5f) * 2f * VIEW_SCALE
-    val wz = lm.z * -0.6f
+    val wz = if (lm.worldZ != 0f) -lm.worldZ else lm.z * -0.6f
     return Triple(wx, wy, wz)
 }
 

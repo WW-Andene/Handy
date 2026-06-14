@@ -81,24 +81,32 @@ class FacePipeline {
      * GPU delegate used; falls back to CPU if unavailable.
      */
     fun init(context: Context) {
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath(MODEL_ASSET)
-            .setDelegate(Delegate.GPU)
-            .build()
 
-        val options = FaceLandmarker.FaceLandmarkerOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setRunningMode(RunningMode.LIVE_STREAM)
-            .setNumFaces(1)
-            .setMinFaceDetectionConfidence(0.5f)
-            .setMinFacePresenceConfidence(0.5f)
-            .setMinTrackingConfidence(0.5f)
-            .setOutputFaceBlendshapes(false)    // We derive expressions from geometry
-            .setOutputFacialTransformationMatrixes(false)
-            .setResultListener { result, _ -> onResult(result) }
-            .build()
-
-        landmarker = FaceLandmarker.createFromOptions(context, options)
+        // FaceLandmarker.createFromOptions() is where delegate init actually occurs;
+        // BaseOptions.build() alone does not probe delegate availability.
+        val delegate = listOf(Delegate.GPU, Delegate.CPU).firstNotNullOfOrNull { d ->
+            try {
+                val opts = BaseOptions.builder().setModelAssetPath(MODEL_ASSET).setDelegate(d).build()
+                FaceLandmarker.createFromOptions(
+                    context,
+                    FaceLandmarker.FaceLandmarkerOptions.builder()
+                        .setBaseOptions(opts)
+                        .setRunningMode(RunningMode.LIVE_STREAM)
+                        .setNumFaces(1)
+                        .setMinFaceDetectionConfidence(0.5f)
+                        .setMinFacePresenceConfidence(0.5f)
+                        .setMinTrackingConfidence(0.5f)
+                        .setOutputFaceBlendshapes(false)
+                        .setOutputFacialTransformationMatrixes(false)
+                        .setResultListener { result, _ -> onResult(result) }
+                        .build()
+                ).also { landmarker = it }
+                d   // return the working delegate
+            } catch (_: Exception) { null }
+        }
+        if (delegate == null) {
+            android.util.Log.e("FacePipeline", "All delegates failed — face tracking unavailable")
+        }
     }
 
     /** Submit a frame for async detection. Safe to call from camera callback thread. */
@@ -186,13 +194,34 @@ class FacePipeline {
         // Mouth corners — lateral stretch indicates smile
         val mouthStretch = mouthCornerStretch(lms)
 
+        // FACE-2 — Iris gaze: compute iris centre position relative to eye orbit.
+        // Returns (horizontal, vertical) in [-1, 1] per eye.
+        val (leftGazeH, leftGazeV)   = irisGaze(lms,
+            irisIdx  = FL.LEFT_IRIS_CENTER,
+            outerIdx = FL.LEFT_EYE_OUTER,
+            innerIdx = FL.LEFT_EYE_INNER,
+            topIdx   = FL.LEFT_EYE_TOP,
+            bottomIdx= FL.LEFT_EYE_BOTTOM
+        )
+        val (rightGazeH, rightGazeV) = irisGaze(lms,
+            irisIdx  = FL.RIGHT_IRIS_CENTER,
+            outerIdx = FL.RIGHT_EYE_OUTER,
+            innerIdx = FL.RIGHT_EYE_INNER,
+            topIdx   = FL.RIGHT_EYE_TOP,
+            bottomIdx= FL.RIGHT_EYE_BOTTOM
+        )
+
         return FaceExpressions(
             leftBlink       = leftBlink,
             rightBlink      = rightBlink,
             jawOpen         = jawOpen,
             leftBrowRaise   = leftBrowRaise,
             rightBrowRaise  = rightBrowRaise,
-            mouthSmile      = mouthStretch
+            mouthSmile      = mouthStretch,
+            leftGazeH       = leftGazeH,
+            leftGazeV       = leftGazeV,
+            rightGazeH      = rightGazeH,
+            rightGazeV      = rightGazeV
         )
     }
 
@@ -229,6 +258,55 @@ class FacePipeline {
         // Smile stretches mouth wider relative to face width; 0.6 is rough neutral ratio
         return ((stretch / faceWidth - 0.6f) / 0.25f).coerceIn(0f, 1f)
     }
+
+    /**
+     * FACE-2 — Compute iris gaze direction for one eye.
+     *
+     * The iris centre position is normalised relative to the eye orbit bounding box:
+     *   horizontal = (iris.x - innerCorner.x) / eyeWidth  → mapped to [-1, +1]
+     *   vertical   = (iris.y - topLid.y)      / eyeHeight → mapped to [-1, +1]
+     *
+     * Returns (horizontalGaze, verticalGaze) each in [-1, 1]:
+     *   H: -1 = full left, 0 = centre, +1 = full right
+     *   V: -1 = full up,   0 = centre, +1 = full down
+     *
+     * When the eye is fully closed (vertical eye height < threshold) returns (0, 0)
+     * to avoid undefined gaze values during blink.
+     */
+    private fun irisGaze(
+        lms:       FaceLandmarks,
+        irisIdx:   Int,
+        outerIdx:  Int,
+        innerIdx:  Int,
+        topIdx:    Int,
+        bottomIdx: Int
+    ): Pair<Float, Float> {
+        if (lms.size <= maxOf(irisIdx, outerIdx, innerIdx, topIdx, bottomIdx)) {
+            return Pair(0f, 0f)
+        }
+
+        val iris   = lms[irisIdx]
+        val outer  = lms[outerIdx]
+        val inner  = lms[innerIdx]
+        val top    = lms[topIdx]
+        val bottom = lms[bottomIdx]
+
+        val eyeWidth  = abs(outer.x - inner.x).coerceAtLeast(1e-4f)
+        val eyeHeight = abs(bottom.y - top.y)
+
+        // Skip gaze when eye is mostly closed — iris position is unreliable
+        if (eyeHeight < eyeWidth * 0.08f) return Pair(0f, 0f)
+
+        // Normalise iris position within eye orbit: 0 = inner corner, 1 = outer corner
+        val hNorm = (iris.x - inner.x) / eyeWidth   // [0, 1] range, 0.5 = centre
+        val vNorm = (iris.y - top.y)   / eyeHeight  // [0, 1] range, 0.5 = centre
+
+        // Map [0, 1] → [-1, +1] with centre at 0.5
+        val h = ((hNorm - 0.5f) * 2f).coerceIn(-1f, 1f)
+        val v = ((vNorm - 0.5f) * 2f).coerceIn(-1f, 1f)
+
+        return Pair(h, v)
+    }
 }
 
 // ─── FaceExpressions ─────────────────────────────────────────────────────────
@@ -254,5 +332,15 @@ data class FaceExpressions(
     /** Right brow raise intensity. 0 = neutral, 1 = fully raised. */
     val rightBrowRaise: Float = 0f,
     /** Mouth smile intensity. 0 = neutral, 1 = broad smile. */
-    val mouthSmile:     Float = 0f
+    val mouthSmile:     Float = 0f,
+
+    // ── FACE-2: Iris gaze ────────────────────────────────────────────────────
+    /** Left eye horizontal gaze. -1 = looking left, 0 = centre, +1 = looking right. */
+    val leftGazeH:      Float = 0f,
+    /** Left eye vertical gaze. -1 = looking up, 0 = centre, +1 = looking down. */
+    val leftGazeV:      Float = 0f,
+    /** Right eye horizontal gaze. -1 = looking left, 0 = centre, +1 = looking right. */
+    val rightGazeH:     Float = 0f,
+    /** Right eye vertical gaze. -1 = looking up, 0 = centre, +1 = looking down. */
+    val rightGazeV:     Float = 0f
 )

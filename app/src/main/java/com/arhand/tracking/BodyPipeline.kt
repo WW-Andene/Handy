@@ -73,22 +73,28 @@ class BodyPipeline {
      * Uses GPU delegate; falls back to CPU if unavailable.
      */
     fun init(context: Context) {
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath(MODEL_ASSET)
-            .setDelegate(Delegate.GPU)
-            .build()
 
-        val options = PoseLandmarker.PoseLandmarkerOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setRunningMode(RunningMode.LIVE_STREAM)
-            .setNumPoses(1)
-            .setMinPoseDetectionConfidence(0.5f)
-            .setMinPosePresenceConfidence(0.5f)
-            .setMinTrackingConfidence(0.5f)
-            .setResultListener { result, _ -> onResult(result) }
-            .build()
-
-        landmarker = PoseLandmarker.createFromOptions(context, options)
+        val delegate = listOf(Delegate.GPU, Delegate.CPU).firstNotNullOfOrNull { d ->
+            try {
+                val opts = BaseOptions.builder().setModelAssetPath(MODEL_ASSET).setDelegate(d).build()
+                PoseLandmarker.createFromOptions(
+                    context,
+                    PoseLandmarker.PoseLandmarkerOptions.builder()
+                        .setBaseOptions(opts)
+                        .setRunningMode(RunningMode.LIVE_STREAM)
+                        .setNumPoses(1)
+                        .setMinPoseDetectionConfidence(0.5f)
+                        .setMinPosePresenceConfidence(0.5f)
+                        .setMinTrackingConfidence(0.5f)
+                        .setResultListener { result, _ -> onResult(result) }
+                        .build()
+                ).also { landmarker = it }
+                d
+            } catch (_: Exception) { null }
+        }
+        if (delegate == null) {
+            android.util.Log.e("BodyPipeline", "All delegates failed — body tracking unavailable")
+        }
     }
 
     /** Submit a frame for async detection. Safe to call from camera callback thread. */
@@ -130,7 +136,15 @@ class BodyPipeline {
 
         // Convert MediaPipe NormalizedLandmark → our Landmark type
         val raw: PoseLandmarks = rawList[0].map { lm ->
-            Landmark(x = lm.x(), y = lm.y(), z = lm.z())
+            // A6 — populate visibility from MediaPipe landmark so BodyRetargeter
+            // can gate per-joint visibility (BODY-4). Defaults to 1.0 in Landmark
+            // constructor, so existing code that ignores visibility is unaffected.
+            Landmark(
+                x          = lm.x(),
+                y          = lm.y(),
+                z          = lm.z(),
+                visibility = lm.visibility().orElse(1f)
+            )
         }
 
         // Smooth with OneEuroFilter

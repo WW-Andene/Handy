@@ -20,10 +20,32 @@ import java.nio.ByteOrder
  */
 object GLBExporter {
 
-    fun export(context: Context, positions: FloatArray, cloudPoints: List<Vec3>): File {
+    /**
+     * Export the hand mesh as a GLB file.
+     *
+     * HAND-5 — [normalMap] is an optional [PhotometricNormalMap] from the scan. When
+     * provided, its normal data is encoded as a PNG image and embedded as the
+     * `normalTexture` in the GLB material block. Importers that support the KHR
+     * PBR material extension (Blender 4+, Unity, Unreal) will apply the photometric
+     * surface detail directly to the mesh shading.
+     *
+     * @param context    Android context for file output.
+     * @param positions  Flat triangle vertex array (x,y,z × 3 per triangle).
+     * @param cloudPoints Unused in export; retained for API compatibility.
+     * @param normalMap  Optional photometric normal map. Null = same output as before.
+     */
+    fun export(
+        context:     Context,
+        positions:   FloatArray,
+        cloudPoints: List<Vec3>,
+        normalMap:   com.arhand.scanner.PhotometricNormalMap? = null,
+        /** HAND-7 — Optional per-pose meshes. Each pair is (poseId, triangleMesh). */
+        poseMeshes:  List<Pair<String, FloatArray>>?          = null,
+        /** R1 — Optional baked colour texture PNG (512×512). Embedded as baseColorTexture. */
+        colorTexturePng: ByteArray?                           = null
+    ): File {
         val triangleCount = positions.size / 9
 
-        // C1 — Vertex welding: quantize to 1e-4 tolerance, share indices for duplicates.
         // Normal accumulation: each welded vertex accumulates the area-weighted normals of
         // all triangles that share it; they are averaged and re-normalised after the loop.
         // This produces smooth Phong normals on the exported mesh, which is correct for a
@@ -97,7 +119,6 @@ object GLBExporter {
             if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z
         }
 
-        // C2 — UV generation: cylindrical projection along the hand's Y axis
         // (world-space Y = wrist-to-fingertip direction in the SDF coordinate frame).
         //
         // U = atan2(x − cx, z − cz) / (2π) + 0.5  — angular wrap around the hand circumference
@@ -141,28 +162,215 @@ object GLBExporter {
         val uvOffset   = posBytes + normBytes
         val idxOffset  = posBytes + normBytes + uvBytes
 
-        val json = """{"asset":{"version":"2.0","generator":"Handy AR Hand Scanner"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],"meshes":[{"name":"hand","primitives":[{"attributes":{"POSITION":0,"NORMAL":1,"TEXCOORD_0":2},"indices":3,"mode":4}]}],"accessors":[{"bufferView":0,"componentType":5126,"count":$vertexCount,"type":"VEC3","min":[$minX,$minY,$minZ],"max":[$maxX,$maxY,$maxZ]},{"bufferView":1,"componentType":5126,"count":$vertexCount,"type":"VEC3"},{"bufferView":2,"componentType":5126,"count":$vertexCount,"type":"VEC2"},{"bufferView":3,"componentType":5125,"count":$indexCount,"type":"SCALAR"}],"bufferViews":[{"buffer":0,"byteOffset":$posOffset,"byteLength":$posBytes},{"buffer":0,"byteOffset":$normOffset,"byteLength":$normBytes},{"buffer":0,"byteOffset":$uvOffset,"byteLength":$uvBytes},{"buffer":0,"byteOffset":$idxOffset,"byteLength":$idxBytes}],"buffers":[{"byteLength":$binSize}]}"""
+        // HAND-5 — Encode normal map as PNG and append to binary buffer.
+        val normalTexturePngBytes: ByteArray? = if (normalMap != null && !normalMap.isEmpty) {
+            encodeNormalMapAsPng(normalMap)
+        } else null
+        val normTexOffset = binBytes.size
+        val normTexBytes  = normalTexturePngBytes?.size ?: 0
+        val normTexPad    = if (normTexBytes > 0) (4 - normTexBytes % 4) % 4 else 0
 
-        val jsonBytes  = json.toByteArray(Charsets.US_ASCII)
-        val jsonPadded = jsonBytes + ByteArray((4 - jsonBytes.size % 4) % 4) { 0x20 }
+        // HAND-7 — Compute morph target delta buffers using MeshRemesher.
+        val baseVertArray = wPositions.toFloatArray()
+        data class MorphDelta(val poseId: String, val bytes: ByteArray)
+        val morphDeltas: List<MorphDelta> = if (!poseMeshes.isNullOrEmpty()) {
+            poseMeshes.mapNotNull { (poseId, poseMesh) ->
+                if (poseMesh.isEmpty()) return@mapNotNull null
+                val delta = com.arhand.depth.MeshRemesher.computeDelta(baseVertArray, poseMesh)
+                val buf = java.nio.ByteBuffer.allocate(delta.size * 4)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                delta.forEach { buf.putFloat(it) }
+                MorphDelta(poseId, buf.array())
+            }
+        } else emptyList()
 
-        val totalLength = 12 + 8 + jsonPadded.size + 8 + binBytes.size
+        val morphBaseOffset = normTexOffset + normTexBytes + normTexPad
+        var morphCursor     = morphBaseOffset
+        data class MorphBvInfo(val poseId: String, val byteOffset: Int, val byteLength: Int)
+        val morphBvInfos = morphDeltas.map { md ->
+            val info = MorphBvInfo(md.poseId, morphCursor, md.bytes.size)
+            val pad  = (4 - md.bytes.size % 4) % 4
+            morphCursor += md.bytes.size + pad
+            info
+        }
+        val totalMorphBytes = morphCursor - morphBaseOffset
+
+        // R1 — Colour texture PNG appended after morph buffers
+        val colorTexOffset  = morphBaseOffset + totalMorphBytes
+        val colorTexBytes   = colorTexturePng?.size ?: 0
+        val colorTexPad     = if (colorTexBytes > 0) (4 - colorTexBytes % 4) % 4 else 0
+
+        val totalBinSize    = binSize + normTexBytes + normTexPad + totalMorphBytes + colorTexBytes + colorTexPad
+
+        // Build accessors, bufferViews, and material JSON — conditionally include
+        // morph target accessors (HAND-7) and normal texture (HAND-5).
+        val baseBvCount     = 4   // pos, norm, uv, idx
+        val normTexBvIdx    = if (normalTexturePngBytes != null) baseBvCount else -1
+        val morphBvStart    = baseBvCount + (if (normalTexturePngBytes != null) 1 else 0)
+
+        // Accessor indices: 0=pos, 1=norm, 2=uv, 3=idx, then morph position accessors
+        val morphAccStart   = 4   // first morph accessor index
+        val morphAccEntries = morphBvInfos.mapIndexed { i, info ->
+            val accIdx = morphAccStart + i
+            val bvIdx  = morphBvStart + i
+            Triple(accIdx, bvIdx, info)
+        }
+
+        // Morph targets JSON: each target references one POSITION accessor
+        val morphTargetsJson = if (morphAccEntries.isNotEmpty()) {
+            val targets = morphAccEntries.joinToString(",") { (accIdx, _, _) ->
+                """{"POSITION":$accIdx}"""
+            }
+            ""targets":[$targets],"
+        } else ""
+
+        // Morph weights (initial = 0 for all targets)
+        val weightsJson = if (morphDeltas.isNotEmpty()) {
+            val ws = morphDeltas.joinToString(",") { "0.0" }
+            ""extras":{"targetNames":[${morphDeltas.joinToString(",") { ""${it.poseId}"" }}]},"
+        } else ""
+
+        // R1 — Colour texture bufferView and image/texture entries
+        val colorTexBvIdx  = morphBvStart + morphBvInfos.size
+        val colorTexImgIdx = if (normalTexturePngBytes != null) 1 else 0
+        val colorTexIdx    = if (normalTexturePngBytes != null) 1 else 0
+
+        val colorTexBvJson = if (colorTexturePng != null)
+            """,{"buffer":0,"byteOffset":$colorTexOffset,"byteLength":$colorTexBytes}"""
+        else ""
+
+        val colorTexImageJson = if (colorTexturePng != null)
+            """,{"bufferView":$colorTexBvIdx,"mimeType":"image/png"}"""
+        else ""
+
+        val colorTexTextureJson = if (colorTexturePng != null)
+            """,{"source":$colorTexImgIdx}"""
+        else ""
+
+        // Material block — includes both normal map and base colour when available
+        val materialJson = buildString {
+            val hasNormal = normalTexturePngBytes != null
+            val hasColor  = colorTexturePng != null
+            if (hasNormal || hasColor) {
+                append(""""materials":[{"name":"hand_material",""")
+                if (hasNormal) append(""""normalTexture":{"index":0},""")
+                append(""""pbrMetallicRoughness":{"metallicFactor":0.0,"roughnessFactor":0.8""")
+                if (hasColor) append(""","baseColorTexture":{"index":$colorTexIdx}""")
+                append("""}}],""")
+                // Textures array
+                append(""""textures":[""")
+                if (hasNormal) append("""{"source":0}""")
+                if (hasNormal && hasColor) append(",")
+                if (hasColor) append("""{"source":$colorTexImgIdx}""")
+                append("""],""")
+                // Images array
+                append(""""images":[""")
+                if (hasNormal) append("""{"bufferView":$normTexBvIdx,"mimeType":"image/png"}""")
+                if (hasNormal && hasColor) append(",")
+                if (hasColor) append("""{"bufferView":$colorTexBvIdx,"mimeType":"image/png"}""")
+                append("""],""")
+            }
+        }
+
+        // Base accessors
+        val baseAccessors = """[{"bufferView":0,"componentType":5126,"count":$vertexCount,"type":"VEC3","min":[$minX,$minY,$minZ],"max":[$maxX,$maxY,$maxZ]},{"bufferView":1,"componentType":5126,"count":$vertexCount,"type":"VEC3"},{"bufferView":2,"componentType":5126,"count":$vertexCount,"type":"VEC2"},{"bufferView":3,"componentType":5125,"count":$indexCount,"type":"SCALAR"}"""
+
+        // Morph accessors — one per pose, type VEC3, same count as base vertices
+        val morphAccessorsJson = if (morphAccEntries.isNotEmpty()) {
+            "," + morphAccEntries.joinToString(",") { (_, bvIdx, _) ->
+                """{"bufferView":$bvIdx,"componentType":5126,"count":$vertexCount,"type":"VEC3"}"""
+            }
+        } else ""
+
+        // Base bufferViews
+        val baseBvJson = """[{"buffer":0,"byteOffset":$posOffset,"byteLength":$posBytes},{"buffer":0,"byteOffset":$normOffset,"byteLength":$normBytes},{"buffer":0,"byteOffset":$uvOffset,"byteLength":$uvBytes},{"buffer":0,"byteOffset":$idxOffset,"byteLength":$idxBytes}"""
+
+        val normTexBvJson = if (normalTexturePngBytes != null)
+            """,{"buffer":0,"byteOffset":$normTexOffset,"byteLength":$normTexBytes}"""
+        else ""
+
+        val morphBvJson = if (morphBvInfos.isNotEmpty()) {
+            "," + morphBvInfos.mapIndexed { i, info ->
+                val pad = (4 - info.byteLength % 4) % 4
+                """{"buffer":0,"byteOffset":${info.byteOffset},"byteLength":${info.byteLength}}"""
+            }.joinToString(",")
+        } else ""
+
+        val primitiveAttrib = """{"attributes":{"POSITION":0,"NORMAL":1,"TEXCOORD_0":2},"indices":3,"mode":4,${morphTargetsJson}${if (normalTexturePngBytes != null) ""material":0" else ""material":0"}}"""
+
+        val json = """{"asset":{"version":"2.0","generator":"Handy AR Hand Scanner"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],"meshes":[{"name":"hand","primitives":[$primitiveAttrib],$weightsJson"weights":[${morphDeltas.joinToString(",") { "0.0" }}]}],${materialJson}"accessors":${baseAccessors}${morphAccessorsJson}],"bufferViews":${baseBvJson}${normTexBvJson}${morphBvJson}${colorTexBvJson}],"buffers":[{"byteLength":$totalBinSize}]}"""
+
+        val binChunkSize  = totalBinSize
+        val totalLength   = 12 + 8 + jsonPadded.size + 8 + binChunkSize
 
         val glb = ByteBuffer.allocate(totalLength).order(ByteOrder.LITTLE_ENDIAN)
-        glb.putInt(0x46546C67)
-        glb.putInt(2)
+        glb.putInt(0x46546C67)   // magic "glTF"
+        glb.putInt(2)             // version
         glb.putInt(totalLength)
+        // JSON chunk
         glb.putInt(jsonPadded.size)
-        glb.putInt(0x4E4F534A)
+        glb.putInt(0x4E4F534A)   // "JSON"
         glb.put(jsonPadded)
-        glb.putInt(binBytes.size)
-        glb.putInt(0x004E4942)
+        // Binary chunk
+        glb.putInt(binChunkSize)
+        glb.putInt(0x004E4942)   // "BIN\0"
         glb.put(binBytes)
+        // Append normal texture PNG if present
+        if (normalTexturePngBytes != null) {
+            glb.put(normalTexturePngBytes)
+            repeat(normTexPad) { glb.put(0) }
+        }
+
+        // HAND-7 — Append morph delta buffers in order
+        morphDeltas.forEach { md ->
+            glb.put(md.bytes)
+            val pad = (4 - md.bytes.size % 4) % 4
+            repeat(pad) { glb.put(0) }
+        }
+
+        // R1 — Append colour texture PNG if present
+        if (colorTexturePng != null) {
+            glb.put(colorTexturePng)
+            repeat(colorTexPad) { glb.put(0) }
+        }
 
         val fileName = "handy_${System.currentTimeMillis()}.glb"
         val file = File(context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), fileName)
-        FileOutputStream(file).use { it.write(glb.array()) }
+        FileOutputStream(file).use { it.write(glb.array(), 0, totalLength) }
 
         return file
+    }
+
+    /**
+     * HAND-5 — Encode a [PhotometricNormalMap] as an RGB PNG.
+     *
+     * Normal components (nx, ny, nz) ∈ [-1, 1] are mapped to RGB ∈ [0, 255]:
+     *   R = (nx + 1) / 2 × 255   (X normal → red channel)
+     *   G = (ny + 1) / 2 × 255   (Y normal → green channel)
+     *   B = nz × 255              (Z/depth component → blue channel; nz ∈ [0, 1])
+     *
+     * This matches the standard OpenGL normal map convention expected by most
+     * importers (Blender, Unity, Unreal). Returns null if encoding fails.
+     */
+    private fun encodeNormalMapAsPng(normalMap: com.arhand.scanner.PhotometricNormalMap): ByteArray? {
+        return try {
+            val bmp = android.graphics.Bitmap.createBitmap(
+                normalMap.width, normalMap.height, android.graphics.Bitmap.Config.ARGB_8888
+            )
+            for (y in 0 until normalMap.height) {
+                for (x in 0 until normalMap.width) {
+                    val n = normalMap.normalAt(x, y) ?: continue
+                    val (nx, ny, nz) = n
+                    val r = ((nx + 1f) * 0.5f * 255f).toInt().coerceIn(0, 255)
+                    val g = ((ny + 1f) * 0.5f * 255f).toInt().coerceIn(0, 255)
+                    val b = (nz * 255f).toInt().coerceIn(0, 255)
+                    bmp.setPixel(x, y, android.graphics.Color.rgb(r, g, b))
+                }
+            }
+            val out = java.io.ByteArrayOutputStream()
+            bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, out)
+            bmp.recycle()
+            out.toByteArray()
+        } catch (_: Exception) { null }
     }
 }

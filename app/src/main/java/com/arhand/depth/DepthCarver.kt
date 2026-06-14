@@ -114,7 +114,18 @@ object DepthCarver {
      * @param frames List of (world-space landmarks, quality score) pairs captured during scan
      * @return Marching cubes mesh as flat position array
      */
-    fun carveAndExtract(frames: List<Pair<List<Vec3>, Float>>): FloatArray {
+    /**
+     * Build SDF from [frames] and extract a mesh.
+     *
+     * IMP-R4: accepts optional [shapeParams] from [ManoShapeFitter]. When provided,
+     * per-segment capsule radii are multiplied by [ManoShapeParams.segmentRadiusScale],
+     * reflecting the user's actual finger thickness rather than population averages.
+     * Falls back to the standard `boneR * 0.14f` base radius when null.
+     */
+    fun carveAndExtract(
+        frames: List<Pair<List<Vec3>, Float>>,
+        shapeParams: ManoShapeFitter.ShapeParams? = null
+    ): FloatArray {
         if (frames.isEmpty()) return FloatArray(0)
 
         // B1: filter to top 75% quality, minimum 1 frame
@@ -134,7 +145,6 @@ object DepthCarver {
         val N = effectiveGridN
         val cellSize = GRID_SIZE * 2f / N
 
-        // B3 — Pose-aware grid origin centering — computed over top-quality frames
         var cx = 0f; var cy = 0f; var cz = 0f; var count = 0
         for (lms in topFrames) {
             for (v in lms) { cx += v.x; cy += v.y; cz += v.z; count++ }
@@ -182,8 +192,11 @@ object DepthCarver {
                         for (segIdx in BONE_SEGMENTS.indices) {
                             val (ai, bi) = BONE_SEGMENTS[segIdx]
                             val a = lms[ai]; val b = lms[bi]
-                            // B2: use per-segment tapered radius
-                            val r = segmentRadius(boneR, SEGMENT_TYPES[segIdx])
+                            // B2: per-segment tapered radius; IMP-R4: scaled by ManoShapeFitter if available
+                            val baseR = segmentRadius(boneR, SEGMENT_TYPES[segIdx])
+                            val r = if (shapeParams != null && segIdx < shapeParams.segmentRadiusScale.size)
+                                baseR * shapeParams.segmentRadiusScale[segIdx]
+                            else baseR
                             val d = capsuleSdf(px, py, pz, a.x, a.y, a.z, b.x, b.y, b.z, r)
                             if (d < minD) minD = d
                         }

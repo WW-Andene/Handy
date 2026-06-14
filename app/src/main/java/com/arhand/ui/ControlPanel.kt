@@ -28,7 +28,7 @@ val RecRed = Color(0xFFE53935)
 
 /**
  * Bottom control panel — matches the HTML prototype's control bar.
- * Buttons: Mode | Torch | Cloud | Camera | REC | Scan
+ * Buttons: Mode | Torch | Cloud | Camera | REC | Scan | Body | Face | Load Model
  */
 @Composable
 fun ControlPanel(
@@ -39,6 +39,14 @@ fun ControlPanel(
     hasModel: Boolean,
     isRecording: Boolean,
     liveMeshActive: Boolean,
+    /** ASSET-1 — Display name of currently loaded asset, or null. */
+    loadedAssetName: String? = null,
+    /** ASSET-1 — True while an asset is being loaded from storage. */
+    assetLoading: Boolean = false,
+    /** BODY-2 — True when body pose tracking is active. */
+    bodyTrackingEnabled: Boolean = false,
+    /** BODY-2 — True when face landmark tracking is active. */
+    faceTrackingEnabled: Boolean = false,
     onMode: () -> Unit,
     onTorch: () -> Unit,
     onCloud: () -> Unit,
@@ -46,7 +54,13 @@ fun ControlPanel(
     onScan: () -> Unit,
     onViewModel: () -> Unit,
     onRecord: () -> Unit,
-    onLiveMesh: () -> Unit
+    onLiveMesh: () -> Unit,
+    /** ASSET-1 — Opens the asset picker dialog. */
+    onLoadModel: () -> Unit = {},
+    /** BODY-2 — Toggle body pose tracking on/off. */
+    onBodyToggle: () -> Unit = {},
+    /** BODY-2 — Toggle face landmark tracking on/off. */
+    onFaceToggle: () -> Unit = {}
 ) {
     Box(
         modifier = Modifier
@@ -82,7 +96,6 @@ fun ControlPanel(
                 )
             }
 
-            // G1 — Live mesh deformation toggle (only shown when a scan exists)
             if (hasModel) {
                 CtrlButton(
                     label       = if (liveMeshActive) "LIVE\nON" else "LIVE\nOFF",
@@ -91,6 +104,35 @@ fun ControlPanel(
                     onClick     = onLiveMesh
                 )
             }
+
+            // ASSET-1 — Load / swap 3D model button (always visible)
+            val modelLabel = when {
+                assetLoading    -> "LOAD\n..."
+                loadedAssetName != null -> "MODEL\nSWAP"
+                else            -> "LOAD\nMODEL"
+            }
+            CtrlButton(
+                label       = modelLabel,
+                active      = loadedAssetName != null,
+                accentColor = Color(0xFFFFD600),
+                onClick     = { if (!assetLoading) onLoadModel() }
+            )
+
+            // BODY-2 — Body pose tracking toggle
+            CtrlButton(
+                label       = if (bodyTrackingEnabled) "BODY\nON" else "BODY\nOFF",
+                active      = bodyTrackingEnabled,
+                accentColor = Color(0xFF00BCD4),
+                onClick     = onBodyToggle
+            )
+
+            // BODY-2 — Face landmark tracking toggle
+            CtrlButton(
+                label       = if (faceTrackingEnabled) "FACE\nON" else "FACE\nOFF",
+                active      = faceTrackingEnabled,
+                accentColor = Color(0xFFE91E63),
+                onClick     = onFaceToggle
+            )
         }
     }
 }
@@ -126,7 +168,6 @@ fun CtrlButton(
         }
     }
 }
-
 
 val Cyan   = Color(0xFF00E5FF)
 val OscGreen = Color(0xFF00E676)

@@ -12,10 +12,10 @@ import kotlin.math.exp
  * Adjust minCutoff to control static noise, beta to control lag.
  */
 class OneEuroFilter(
-    private val minCutoffXY: Float,
-    private val betaXY: Float,
-    private val minCutoffZ: Float,
-    private val betaZ: Float,
+    private var minCutoffXY: Float,
+    private var betaXY: Float,
+    private var minCutoffZ: Float,
+    private var betaZ: Float,
     private val dCutoff: Float = 1.0f   // Hz — standard per paper
 ) {
     data class ScalarState(
@@ -66,6 +66,19 @@ class OneEuroFilter(
     }
 
     /**
+     * PERF-2 — Update filter parameters at runtime.
+     * Resets internal state so the filter reinitialises on the next frame.
+     * The new parameters take effect immediately on the next [smoothPerJoint] call.
+     */
+    fun setParams(newMinCutoffXY: Float, newBetaXY: Float, newMinCutoffZ: Float, newBetaZ: Float) {
+        minCutoffXY = newMinCutoffXY
+        betaXY      = newBetaXY
+        minCutoffZ  = newMinCutoffZ
+        betaZ       = newBetaZ
+        reset()
+    }
+
+    /**
      * Smooth a list of 21 landmarks. Returns new smoothed list.
      */
     fun smooth(lms: List<Landmark>, nowMs: Long): List<Landmark> =
@@ -73,8 +86,6 @@ class OneEuroFilter(
 
     /**
      * A2 — Confidence-weighted variant: caller supplies effective cutoff/beta.
-     * When confidence is low, use higher minCutoff + lower beta (more aggressive filtering).
-     * When confidence is high, use base params (more responsive).
      */
     fun smooth(lms: List<Landmark>, nowMs: Long, effectiveCutoffXY: Float, effectiveBetaXY: Float): List<Landmark> {
         ensureInit(lms.size, nowMs)
@@ -92,6 +103,52 @@ class OneEuroFilter(
                 val sx = filterScalar(s.x, lm.x, nowMs, effectiveCutoffXY, effectiveBetaXY)
                 val sy = filterScalar(s.y, lm.y, nowMs, effectiveCutoffXY, effectiveBetaXY)
                 val sz = filterScalar(s.z, lm.z, nowMs, minCutoffZ,        betaZ)
+                lm.copy(x = sx, y = sy, z = sz)
+            }
+        }
+    }
+
+    /**
+     * IMP-R1 — Per-landmark dynamic params: each landmark gets its own cutoff/beta
+     * derived from [speedRatios] (from TDF.lastSpeedRatios).
+     *
+     * Rationale: a fast-moving fingertip and a nearly-still wrist in the same frame
+     * need different filter parameters. A single global cutoff is always a compromise.
+     * Fast joints: lower cutoff (more responsive — don't lag behind the motion).
+     * Slow joints: higher cutoff (more aggressive filtering — suppress static noise).
+     *
+     * @param speedRatios  Per-landmark speed ratios in [0,1] from [TemporalDepthFusion.lastSpeedRatios].
+     *                     If null or wrong length, falls back to confidence-weighted global params.
+     * @param baseCutoff   Base minCutoff at zero speed (high smoothing).
+     * @param fastCutoff   Cutoff at full speed (pass-through).
+     */
+    fun smoothPerJoint(
+        lms: List<Landmark>,
+        nowMs: Long,
+        speedRatios: FloatArray?,
+        baseCutoff: Float,
+        fastCutoff: Float,
+        baseBeta: Float,
+        fastBeta: Float
+    ): List<Landmark> {
+        ensureInit(lms.size, nowMs)
+        val st = states!!
+        return lms.mapIndexed { i, lm ->
+            val ratio = speedRatios?.getOrNull(i) ?: 0f
+            val eCutoff = baseCutoff + (fastCutoff - baseCutoff) * ratio
+            val eBeta   = baseBeta   + (fastBeta   - baseBeta)   * ratio
+            if (st[i] == null) {
+                st[i] = LandmarkState(
+                    ScalarState(lm.x, 0f, nowMs),
+                    ScalarState(lm.y, 0f, nowMs),
+                    ScalarState(lm.z, 0f, nowMs)
+                )
+                lm
+            } else {
+                val s = st[i]!!
+                val sx = filterScalar(s.x, lm.x, nowMs, eCutoff, eBeta)
+                val sy = filterScalar(s.y, lm.y, nowMs, eCutoff, eBeta)
+                val sz = filterScalar(s.z, lm.z, nowMs, minCutoffZ, betaZ)
                 lm.copy(x = sx, y = sy, z = sz)
             }
         }

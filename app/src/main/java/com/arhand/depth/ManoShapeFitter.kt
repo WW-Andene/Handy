@@ -85,7 +85,19 @@ class ManoShapeFitter {
         val segmentRadiusScale: FloatArray,   // length N_SEGMENTS
         val palmSizeMm: Float,                 // estimated palm size in world units
         val fingerAspectRatios: FloatArray     // length 5: per-finger length/width ratio
-    )
+    ) {
+        companion object {
+            /**
+             * Item 4 — Identity shape params: all scales = 1.0 (mean hand prior).
+             * Used when FEATURE_SMPL_BODY = false so ManoShapeFitter is not invoked.
+             */
+            val IDENTITY = ShapeParams(
+                segmentRadiusScale  = FloatArray(N_SEGMENTS) { 1f },
+                palmSizeMm          = 0.10f,
+                fingerAspectRatios  = FloatArray(5) { 1f }
+            )
+        }
+    }
 
     /**
      * Fit shape parameters to the provided world-space landmark frame set.

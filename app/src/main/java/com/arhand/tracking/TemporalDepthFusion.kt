@@ -1,5 +1,7 @@
 package com.arhand.tracking
 
+import kotlin.math.exp
+
 /**
  * Temporal Depth Fusion (TDF) — port of applyTemporalDepthFusion() from the HTML prototype.
  *
@@ -40,6 +42,14 @@ class TemporalDepthFusion {
     )
 
     private var states: Array<LandmarkDepthState?>? = null
+
+    /**
+     * IMP-R1 — Per-joint speed ratios from the last [apply] call.
+     * Index matches landmark index. Values in [0,1]: 0=fully still, 1=at full speed.
+     * Read by [HandPipeline] to dynamically tune OEF params per-joint.
+     * Populated only after the first non-cold-start frame per joint.
+     */
+    val lastSpeedRatios: FloatArray = FloatArray(21) { 0f }
 
     fun reset() {
         states = null
@@ -83,8 +93,13 @@ class TemporalDepthFusion {
                 } else {
                     val dt = maxOf((nowMs - s.tMs) * 0.001f, 1e-4f)
                     val instDz = (rawZ - s.z) / dt
-                    // EMA velocity
-                    s.dz = s.dz * 0.7f + instDz * 0.3f
+                    // EMA velocity — alpha scaled by dt so the smoothing time-constant
+                    // stays consistent across variable frame intervals (dropped frames,
+                    // throttled inference). At 33ms (30fps) alpha≈0.3; at 66ms (missed
+                    // frame) alpha≈0.5 (more responsive, not more sluggish).
+                    // Time-constant τ = -dt / ln(1 - α_base), solved for α_base ≈ 0.3 at dt=33ms
+                    val velAlpha = (1f - exp(-dt / 0.077f)).coerceIn(0.05f, 0.95f)
+                    s.dz = s.dz + velAlpha * (instDz - s.dz)
                     val absDz = Math.abs(s.dz)
 
                     // A4: record |dz| into rolling history
@@ -95,6 +110,7 @@ class TemporalDepthFusion {
                     // A4: use per-joint 90th-percentile speed threshold
                     val speedThresh = percentile90SpeedThresh(s)
                     val speedRatio = minOf(1f, absDz / speedThresh)
+                    lastSpeedRatios[i] = speedRatio
                     val alpha = ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * speedRatio
                     s.z = s.z + alpha * (rawZ - s.z)
                     s.tMs = nowMs
